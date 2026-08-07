@@ -62,7 +62,7 @@ REGIONS = {
 }
 
 st.set_page_config(
-    page_title="Prospecteur Foncier V5",
+    page_title="Prospecteur Foncier V4",
     page_icon="🏗️",
     layout="wide",
 )
@@ -73,7 +73,7 @@ st.set_page_config(
 BDNB_API = "https://api.bdnb.io/v1/bdnb/donnees/batiment_groupe_complet"
 
 HEADERS = {
-    "User-Agent": "ProspecteurFoncier/5.0 (Streamlit; donnees publiques)",
+    "User-Agent": "ProspecteurFoncier/4.0 (Streamlit; donnees publiques)",
     "Accept": "application/json, application/geo+json, */*",
 }
 
@@ -643,8 +643,9 @@ def analyse_commune(
         if not terrain_bati:
             score += 5
         elif bdnb_info["maison_individuelle"]:
-            # Une maison individuelle reste intéressante quelle que soit son emprise.
             score += 5
+            if terrain_libre_pct >= 75:
+                score += 5
         if zr["typezone"] == "AU":
             score -= 10
         score = max(0, min(100, score))
@@ -789,9 +790,9 @@ def generate_letter(row, signataire, fonction, email, ville_signature):
 # --------------------------
 # Interface
 # --------------------------
-st.title("🏗️ Prospecteur Foncier — V5")
+st.title("🏗️ Prospecteur Foncier — V4")
 st.caption(
-    "Cadastre réel + PLU/PLUi + BDNB : toute maison individuelle peut être retenue, même si elle occupe une grande partie de la parcelle."
+    "Cadastre réel + PLU/PLUi + BDNB : les parcelles bâties sont limitées aux maisons individuelles à grand terrain."
 )
 
 st.info(
@@ -902,35 +903,37 @@ with c7:
 st.markdown("#### Filtre des parcelles déjà bâties")
 h1, h2 = st.columns(2)
 with h1:
+    min_terrain_libre_pct = st.slider(
+        "Part minimale de terrain libre autour de la maison (%)",
+        min_value=40,
+        max_value=95,
+        value=70,
+        step=5,
+        help=(
+            "Une parcelle bâtie n'est conservée que si la maison et ses dépendances "
+            "occupent au maximum le complément. Exemple : 70 % libre = emprise bâtie max. 30 %."
+        ),
+    )
+with h2:
     max_log_existants = st.number_input(
         "Nombre maximum de logements déjà présents",
         min_value=1,
         max_value=5,
-        value=1,
+        value=2,
         step=1,
         help=(
-            "Par défaut : 1 seul logement existant. Une grande villa reste donc éligible, "
-            "même si le bâtiment occupe une grande partie de la parcelle."
-        ),
-    )
-with h2:
-    prioriser_grand_terrain = st.checkbox(
-        "Prioriser les maisons avec beaucoup de terrain libre",
-        value=True,
-        help=(
-            "Ce réglage influence seulement le score et le classement. "
-            "Il n'élimine plus une maison individuelle qui occupe presque toute sa parcelle."
+            "Sécurité supplémentaire : une parcelle avec trop de logements existants est écartée "
+            "même si la BDNB la classe en résidentiel individuel."
         ),
     )
 
 st.caption(
-    "Règle V5 : une parcelle bâtie est retenue dès lors que la BDNB la qualifie en résidentiel individuel "
-    "et qu'elle ne dépasse pas le nombre de logements existants choisi. "
-    "Le pourcentage de terrain libre reste affiché, mais n'est plus un critère d'exclusion."
+    "Règle V4 : dès qu'une parcelle est bâtie, elle n'est retenue que si la BDNB la qualifie "
+    "en résidentiel individuel, sans bâtiment collectif, et si la part de terrain libre respecte ton seuil."
 )
 
 st.warning(
-    "Important : le filtre maison/résidence utilise la BDNB et le cadastre. Une grande maison individuelle reste éligible même avec peu de terrain libre. Le zonage U/AU permet une présélection réelle, mais une zone U ne garantit pas à elle seule "
+    "Important : le filtre maison/résidence utilise la BDNB et le cadastre. Le zonage U/AU permet une présélection réelle, mais une zone U ne garantit pas à elle seule "
     "qu'un programme de logements soit autorisé. La prochaine brique du logiciel devra lire automatiquement "
     "le règlement écrit de chaque zone (emprise, hauteur, retraits, stationnement, mixité, etc.)."
 )
@@ -1012,16 +1015,9 @@ if results is not None and st.session_state.get("analysis_insee") == insee:
     built_ok = (
         (filtered["maison_individuelle"] == True)
         & (filtered["nb_log_existants"] <= int(max_log_existants))
+        & (filtered["terrain_libre_pct"] >= float(min_terrain_libre_pct))
     )
     filtered = filtered[(filtered["terrain_bati"] == False) | built_ok].copy()
-
-    # Le terrain libre ne sert plus à exclure les maisons. Il ne sert qu'à les prioriser.
-    if prioriser_grand_terrain and not filtered.empty:
-        bonus = (filtered["terrain_libre_pct"] / 20.0).clip(lower=0, upper=5)
-        house_mask = filtered["terrain_bati"] == True
-        filtered.loc[house_mask, "score"] = (
-            filtered.loc[house_mask, "score"] + bonus.loc[house_mask]
-        ).clip(upper=100).round().astype(int)
 
     if terrain_mode == "Terrain nu":
         filtered = filtered[filtered["terrain_bati"] == False]
@@ -1030,6 +1026,7 @@ if results is not None and st.session_state.get("analysis_insee") == insee:
             (filtered["terrain_bati"] == True)
             & (filtered["maison_individuelle"] == True)
             & (filtered["nb_log_existants"] <= int(max_log_existants))
+            & (filtered["terrain_libre_pct"] >= float(min_terrain_libre_pct))
         ]
 
     filtered = filtered.sort_values(
@@ -1042,7 +1039,7 @@ if results is not None and st.session_state.get("analysis_insee") == insee:
     m1.metric("Parcelles présélectionnées", len(filtered))
     m2.metric("Terrains nus", int((filtered["terrain_bati"] == False).sum()))
     m3.metric(
-        "Maisons individuelles",
+        "Maisons + grand terrain",
         int(((filtered["terrain_bati"] == True) & (filtered["maison_individuelle"] == True)).sum()),
     )
     m4.metric("Zone urbanisme", st.session_state.get("analysis_partition", "—"))
@@ -1286,8 +1283,8 @@ with st.expander("Ce que la V2 analyse réellement"):
 - **Exclusions** : zones A et N exclues ; zones U analysées ; zones AU optionnelles.
 - **Terrain nu / bâti** : déterminé par croisement spatial avec les bâtiments cadastraux.
 - **Maison vs résidence** : qualification via la BDNB ; les bâtiments résidentiels collectifs sont exclus des terrains bâtis.
-- **Terrain libre** : calculé et affiché à partir de l'emprise cadastrale existante ; utilisé pour prioriser, jamais pour exclure une maison individuelle.
-- **Sécurité** : 1 logement existant par défaut ; les résidences collectives sont exclues ; si la BDNB ne qualifie pas le bâti, la parcelle bâtie est écartée.
+- **Grand terrain** : calcul de la part libre à partir de l'emprise cadastrale existante ; seuil réglable.
+- **Sécurité** : nombre maximum de logements existants réglable ; si la BDNB ne qualifie pas le bâti, la parcelle bâtie est écartée.
 - **Capacité logements** : SDP = surface brute × ratio SDP ; SHAB = SDP × ratio SHAB ; logements = SHAB ÷ ratio SHAB/logement.
 - **Adresse** : recherchée pour les parcelles sélectionnées via le géocodage inverse de la Géoplateforme.
 - **Courrier** : généré à partir du modèle SAGEC fourni.
