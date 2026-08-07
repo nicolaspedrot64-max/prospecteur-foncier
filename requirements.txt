@@ -6,4 +6,3 @@ shapely>=2.0
 pyproj>=3.6
 pydeck>=0.9
 duckdb>=1.1
-pypdf>=5.0
