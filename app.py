@@ -62,7 +62,7 @@ REGIONS = {
 }
 
 st.set_page_config(
-    page_title="Prospecteur Foncier V3.2.1",
+    page_title="Prospecteur Foncier V3.2.2",
     page_icon="🏗️",
     layout="wide",
 )
@@ -73,7 +73,7 @@ st.set_page_config(
 BDNB_API = "https://api.bdnb.io/v1/bdnb/donnees/batiment_groupe_complet"
 
 HEADERS = {
-    "User-Agent": "ProspecteurFoncier/3.2.1 (Streamlit; donnees publiques)",
+    "User-Agent": "ProspecteurFoncier/3.2.2 (Streamlit; donnees publiques)",
     "Accept": "application/json, application/geo+json, */*",
 }
 
@@ -417,6 +417,75 @@ HABITAT_KEYWORDS = [
     "mixte resident",
 ]
 
+
+ECONOMIC_VOCATION_KEYWORDS = [
+    "zone d activite",
+    "zone d activites",
+    "secteur d activite",
+    "secteur d activites",
+    "activite economique",
+    "activites economiques",
+    "vocation economique",
+    "zone economique",
+    "parc d activite",
+    "parc d activites",
+    "zone industrielle",
+    "secteur industriel",
+    "zone artisanale",
+    "secteur artisanal",
+    "zone commerciale",
+    "secteur commercial",
+    "zone logistique",
+    "secteur logistique",
+    "plateforme logistique",
+    "zone tertiaire",
+    "secteur tertiaire",
+    "pole economique",
+    "pole d activite",
+    "pole d activites",
+]
+
+
+def detect_economic_vocation(props):
+    """
+    Exclusion forte des secteurs dont la vocation dominante est l'activité économique.
+
+    Sources structurées :
+    - ancien standard CNIG : DESTDOMI=02 = activité ;
+    - standard CNIG récent : FORMDOMI 0200 à 0203 = activité /
+      industrielle-logistique-commerciale / commerces / bureaux.
+
+    En complément, on analyse le libellé et le nom long du zonage.
+    Les secteurs mixtes habitat/activité (DESTDOMI=03 / FORMDOMI=0300)
+    ne sont pas considérés comme purement économiques par cette fonction.
+    """
+    destdomi = str(props.get("destdomi") or "").strip()
+    formdomi = str(props.get("formdomi") or "").strip()
+    libelle = str(props.get("libelle") or "")
+    libelong = str(props.get("libelong") or "")
+    text = normalize_text(" ".join([libelle, libelong]))
+
+    dd = re.sub(r"\D", "", destdomi)
+    fd = re.sub(r"\D", "", formdomi)
+
+    if dd in {"2", "02"}:
+        return True, "DESTDOMI=02 : vocation dominante activité"
+
+    if fd.startswith("02") and len(fd) >= 2:
+        labels = {
+            "0200": "activité",
+            "0201": "activité industrielle / logistique / commerciale",
+            "0202": "activité commerces",
+            "0203": "activité bureaux",
+        }
+        return True, f"FORMDOMI={formdomi} : {labels.get(fd, 'activité économique')}"
+
+    for keyword in ECONOMIC_VOCATION_KEYWORDS:
+        if keyword in text:
+            return True, f"Libellé PLU : {libelle or libelong}"
+
+    return False, ""
+
 # Standard CNIG 2024/2025 :
 # 20 = destination Habitation ; 21 = sous-destination Logement ; 22 = Hébergement.
 DESTINATION_CODES = [
@@ -505,6 +574,19 @@ def analyse_habitat_zone(props, include_au=True, include_conditionnel=True):
     destcdt = parse_destination_codes(destcdt_raw)
     destnon = parse_destination_codes(destnon_raw)
 
+    # Priorité absolue : éliminer les secteurs dont la vocation dominante
+    # est l'activité économique, même si certaines destinations y sont ponctuellement admises.
+    economic_vocation, economic_reason = detect_economic_vocation(props)
+    if economic_vocation:
+        return {
+            "habitat_eligible": False,
+            "habitat_statut": "Exclue — secteur à vocation d'activités économiques",
+            "habitat_preuve": economic_reason,
+            "habitat_confiance": 100,
+            "typezone_normalise": typezone,
+            "economic_vocation": True,
+        }
+
     # 0. Type de zone : on exclut les zones non immédiatement destinées à bâtir du logement.
     if typezone in {"A", "N"}:
         return {
@@ -513,6 +595,7 @@ def analyse_habitat_zone(props, include_au=True, include_conditionnel=True):
             "habitat_preuve": f"TYPEZONE={typezone}",
             "habitat_confiance": 100,
             "typezone_normalise": typezone,
+            "economic_vocation": False,
         }
 
     if typezone == "AUs":
@@ -522,6 +605,7 @@ def analyse_habitat_zone(props, include_au=True, include_conditionnel=True):
             "habitat_preuve": "TYPEZONE=AUs : ouverture subordonnée à modification/révision du PLU",
             "habitat_confiance": 100,
             "typezone_normalise": typezone,
+            "economic_vocation": False,
         }
 
     if typezone in {"AUc", "AU"} and not include_au:
@@ -531,6 +615,7 @@ def analyse_habitat_zone(props, include_au=True, include_conditionnel=True):
             "habitat_preuve": f"TYPEZONE={typezone}",
             "habitat_confiance": 100,
             "typezone_normalise": typezone,
+            "economic_vocation": False,
         }
 
     # 1. Standards CNIG récents : destination Habitation / Logement.
@@ -544,6 +629,7 @@ def analyse_habitat_zone(props, include_au=True, include_conditionnel=True):
             "habitat_preuve": f"DESTNON={','.join(sorted(destnon & housing_codes))}",
             "habitat_confiance": 100,
             "typezone_normalise": typezone,
+            "economic_vocation": False,
         }
 
     if destoui & housing_codes:
@@ -553,6 +639,7 @@ def analyse_habitat_zone(props, include_au=True, include_conditionnel=True):
             "habitat_preuve": f"DESTOUI={','.join(sorted(destoui & housing_codes))}",
             "habitat_confiance": 100,
             "typezone_normalise": typezone,
+            "economic_vocation": False,
         }
 
     if destcdt & housing_codes:
@@ -563,6 +650,7 @@ def analyse_habitat_zone(props, include_au=True, include_conditionnel=True):
                 "habitat_preuve": f"DESTCDT={','.join(sorted(destcdt & housing_codes))}",
                 "habitat_confiance": 90,
                 "typezone_normalise": typezone,
+                "economic_vocation": False,
             }
         return {
             "habitat_eligible": False,
@@ -570,6 +658,7 @@ def analyse_habitat_zone(props, include_au=True, include_conditionnel=True):
             "habitat_preuve": f"DESTCDT={','.join(sorted(destcdt & housing_codes))}",
             "habitat_confiance": 90,
             "typezone_normalise": typezone,
+            "economic_vocation": False,
         }
 
     # Si les champs DEST* sont renseignés mais ne contiennent ni Habitation ni Logement,
@@ -585,6 +674,7 @@ def analyse_habitat_zone(props, include_au=True, include_conditionnel=True):
             ),
             "habitat_confiance": 95,
             "typezone_normalise": typezone,
+            "economic_vocation": False,
         }
 
     # 2. Ancien standard CNIG : vocation dominante.
@@ -597,6 +687,7 @@ def analyse_habitat_zone(props, include_au=True, include_conditionnel=True):
             "habitat_preuve": "DESTDOMI=01 (habitat)",
             "habitat_confiance": 95,
             "typezone_normalise": typezone,
+            "economic_vocation": False,
         }
     if dd in {"3", "03"}:
         return {
@@ -605,6 +696,7 @@ def analyse_habitat_zone(props, include_au=True, include_conditionnel=True):
             "habitat_preuve": "DESTDOMI=03 (mixte habitat/activité)",
             "habitat_confiance": 90,
             "typezone_normalise": typezone,
+            "economic_vocation": False,
         }
     if dd in {"2", "02", "4", "04", "5", "05", "7", "07", "8", "08", "9", "09", "10"}:
         return {
@@ -613,6 +705,7 @@ def analyse_habitat_zone(props, include_au=True, include_conditionnel=True):
             "habitat_preuve": f"DESTDOMI={destdomi}",
             "habitat_confiance": 95,
             "typezone_normalise": typezone,
+            "economic_vocation": False,
         }
 
     # 3. Analyse sémantique du libellé et du nom long.
@@ -626,6 +719,7 @@ def analyse_habitat_zone(props, include_au=True, include_conditionnel=True):
             "habitat_preuve": f"{libelle} — {libelong}".strip(" —"),
             "habitat_confiance": 80,
             "typezone_normalise": typezone,
+            "economic_vocation": False,
         }
 
     if negative and not positive:
@@ -635,6 +729,7 @@ def analyse_habitat_zone(props, include_au=True, include_conditionnel=True):
             "habitat_preuve": f"{libelle} — {libelong}".strip(" —"),
             "habitat_confiance": 80,
             "typezone_normalise": typezone,
+            "economic_vocation": False,
         }
 
     # 4. Haute précision : en mode Habitat strict, une zone sans preuve explicite
@@ -719,6 +814,8 @@ def analyse_commune(
                 "libelle": props.get("libelle") or "",
                 "libelong": props.get("libelong") or "",
                 "destdomi": props.get("destdomi") or "",
+                "formdomi": props.get("formdomi") or "",
+                "economic_vocation": bool(habitat.get("economic_vocation", False)),
                 "destoui": props.get("destoui") or "",
                 "destcdt": props.get("destcdt") or "",
                 "destnon": props.get("destnon") or "",
@@ -848,6 +945,8 @@ def analyse_commune(
                 "destcdt": zr["destcdt"],
                 "destnon": zr["destnon"],
                 "destdomi": zr["destdomi"],
+                "formdomi": zr["formdomi"],
+                "economic_vocation": bool(zr["economic_vocation"]),
                 "reglement_url": zr["url_reglement"],
                 "date_zone": zr["datvalid"],
                 "logements_estimes": logements,
@@ -869,6 +968,7 @@ def analyse_commune(
                 "zone": zr["libelle"],
                 "typezone": zr["typezone"],
                 "habitat": zr["habitat_statut"],
+                "vocation_economique": "Oui" if zr["economic_vocation"] else "Non",
                 "confiance_habitat": zr["habitat_confiance"],
                 "collectif": "Oui" if bdnb_info["collectif_existant"] else "Non",
                 "logements": logements,
@@ -907,6 +1007,8 @@ def analyse_commune(
         "destcdt",
         "destnon",
         "destdomi",
+        "formdomi",
+        "economic_vocation",
         "reglement_url",
         "date_zone",
         "logements_estimes",
@@ -1005,9 +1107,9 @@ def generate_letter(row, signataire, fonction, email, ville_signature):
 # --------------------------
 # Interface
 # --------------------------
-st.title("🏗️ Prospecteur Foncier — V3.2.1 — Filtre Habitat")
+st.title("🏗️ Prospecteur Foncier — V3.2.2 — Habitat hors secteurs économiques")
 st.caption(
-    "Cadastre réel + PLU/PLUi + filtre Habitat renforcé + calcul SDP/SHAB + exclusion du collectif existant."
+    "Cadastre réel + PLU/PLUi + filtre Habitat renforcé + exclusion des secteurs à vocation économique + calcul SDP/SHAB."
 )
 
 st.info(
@@ -1137,12 +1239,18 @@ with h2:
     )
 
 st.caption(
+    "Filtre économique actif : les zones dont la vocation dominante est l'activité économique "
+    "(activité, industrie, logistique, commerce, artisanat, bureaux, parc d'activités, etc.) "
+    "sont éliminées avant même le filtre Habitat."
+)
+
+st.caption(
     "Filtre bâti : une parcelle déjà construite reste éligible, sauf si la BDNB identifie "
     "un bâtiment en « Résidentiel collectif » sur cette parcelle."
 )
 
 st.warning(
-    "Le filtre Habitat réduit fortement les faux positifs : il exploite d'abord les champs structurés "
+    "Le moteur élimine d'abord les secteurs à vocation d'activités économiques (DESTDOMI=02, FORMDOMI 0200–0203 et libellés explicites). Le filtre Habitat réduit ensuite les faux positifs : il exploite d'abord les champs structurés "
     "DESTOUI / DESTCDT / DESTNON du standard CNIG, puis DESTDOMI pour les anciens PLU et enfin "
     "les libellés explicites de zone. Les règles de gabarit (hauteur, retraits, emprise, stationnement, "
     "OAP, prescriptions et servitudes) restent à vérifier pour la faisabilité détaillée."
@@ -1233,6 +1341,10 @@ if results is not None and st.session_state.get("analysis_insee") == insee:
         (results["logements_estimes"] >= min_log)
         & (results["logements_estimes"] <= max_log)
     ].copy()
+
+    # Sécurité supplémentaire : les secteurs à vocation économique sont toujours exclus.
+    if "economic_vocation" in filtered.columns:
+        filtered = filtered[filtered["economic_vocation"] == False].copy()
 
     # Filtre Habitat haute précision.
     if habitat_only:
@@ -1348,6 +1460,8 @@ if results is not None and st.session_state.get("analysis_insee") == insee:
                 "habitat_statut",
                 "habitat_preuve",
                 "habitat_confiance",
+                "formdomi",
+                "economic_vocation",
                 "classe_zone",
                 "logements_estimes",
                 "score",
@@ -1381,6 +1495,8 @@ if results is not None and st.session_state.get("analysis_insee") == insee:
                 "habitat_confiance": st.column_config.ProgressColumn(
                     "Confiance habitat", min_value=0, max_value=100
                 ),
+                "formdomi": st.column_config.TextColumn("Forme dominante CNIG"),
+                "economic_vocation": st.column_config.CheckboxColumn("Vocation économique"),
                 "classe_zone": st.column_config.TextColumn("Qualification"),
                 "logements_estimes": st.column_config.NumberColumn("Logements estimés"),
                 "score": st.column_config.ProgressColumn("Score", min_value=0, max_value=100),
@@ -1405,6 +1521,8 @@ if results is not None and st.session_state.get("analysis_insee") == insee:
                 "habitat_statut",
                 "habitat_preuve",
                 "habitat_confiance",
+                "formdomi",
+                "economic_vocation",
                 "classe_zone",
                 "logements_estimes",
                 "score",
@@ -1509,6 +1627,7 @@ with st.expander("Ce que la V2 analyse réellement"):
 - **Communes** : chargées dynamiquement pour la Nouvelle-Aquitaine et l'Occitanie.
 - **Cadastre** : parcelles et bâtiments réels du dernier millésime Etalab.
 - **PLU / PLUi** : zonages du Géoportail de l'Urbanisme via l'API Carto IGN.
+- **Exclusion économique prioritaire** : `DESTDOMI=02`, `FORMDOMI=0200/0201/0202/0203` et libellés explicites d'activités économiques sont éliminés.
 - **Filtre Habitat structuré** : lecture des champs CNIG `DESTOUI`, `DESTCDT`, `DESTNON` ; les codes 20/21 correspondent à Habitation/Logement.
 - **Compatibilité anciens PLU** : lecture de `DESTDOMI` (01 habitat ; 03 mixte habitat/activité) puis analyse des libellés explicites.
 - **Exclusions de zonage** : A, N et AUs sont écartées ; U et AUc sont analysées selon la destination logement.
