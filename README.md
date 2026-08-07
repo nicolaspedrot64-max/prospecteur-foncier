@@ -1,56 +1,53 @@
-# Prospecteur Foncier V3.5 — corrélation cadastre / règlement graphique
+# Prospecteur Foncier V3.6 — moteur PLU hybride
 
-Cette version repart de la V3.3.1 stable et abandonne l'idée de lire d'abord
-le règlement PDF pour calculer le gabarit.
+Cette version vise à se rapprocher d'une préfaisabilité de type outil métier.
 
-## Source principale : prescriptions graphiques GPU
+## Pourquoi la V3.5 était limitée
 
-Le moteur croise chaque géométrie cadastrale avec :
-- `prescription-surf`
-- `prescription-lin`
-- `prescription-pct`
+API Carto restitue les géométries et les attributs principaux des prescriptions,
+mais sa documentation utilisateur ne liste pas les attributs complémentaires CNIG
+`LIB_ATTRn / LIB_VALn` où peuvent se trouver `COEF_EMPRISE_SOL_MAX`,
+`HAUTEUR_METRES_MAX` ou `HAUTEUR_RPLUS_ETAGES`.
 
-Il recherche en priorité :
-- CNIG `38-02` : emprise au sol maximale ;
-- CNIG `39-02` : hauteur maximale ;
-- variantes de hauteur localisées lorsqu'elles existent.
+Le moteur V3.5 pouvait donc connaître le périmètre d'une prescription 38/39
+sans disposer de sa valeur chiffrée.
 
-## Valeurs
+## Stratégie V3.6
 
-Le moteur lit :
-1. les couples `LIB_ATTRn / LIB_VALn` s'ils sont exposés ;
-2. à défaut, les champs `TXT`, `LIBELLE`, `NATURE`.
+1. Identifier la zone PLU/PLUi de la parcelle.
+2. Lire une seule fois le règlement écrit lié à cette zone via `URLFIC`.
+3. Extraire une règle de base :
+   - emprise au sol maximale ;
+   - R+N / nombre de niveaux / hauteur maximale.
+4. Charger les prescriptions graphiques :
+   - 38-02 : emprise maximale ;
+   - 39-02 : hauteur maximale.
+5. Si une prescription graphique n'a pas de valeur dans l'API, lire uniquement
+   le document pointé par son `URLFIC`.
+6. Découper géométriquement la parcelle en sous-surfaces :
+   la règle graphique locale remplace la règle de zone uniquement là où elle s'applique.
+7. Additionner la surface brute de chaque sous-surface.
+8. Ne calculer les logements que si emprise + hauteur couvrent au moins 98 % de la parcelle.
 
-Il reconnaît notamment :
-- pourcentages d'emprise ;
-- coefficients CES décimaux ;
-- R+1, R+2, etc. ;
-- nombre de niveaux ;
-- hauteurs en mètres.
+## Formule
 
-## Calcul
+Surface brute = somme(surface de chaque sous-zone × emprise applicable × niveaux applicables)
 
-Si emprise + hauteur/niveaux sont suffisamment couverts graphiquement :
-- Emprise constructible = surface cadastrale × emprise PLU
-- Surface brute = emprise constructible × niveaux
+Puis :
 - SDP = surface brute × ratio SDP
 - SHAB = SDP × ratio SHAB
-- Logements = SHAB / ratio SHAB par logement
+- logements = SHAB / ratio SHAB par logement
 
-Si le graphique n'est pas assez complet, la parcelle est conservée dans
-« Gabarit PLU à vérifier » : elle n'est pas supprimée et aucune valeur n'est inventée.
+## Limites
 
-## Limite nationale importante
-
-Tous les PLU/PLUi ne spatialisent pas les règles d'emprise et de hauteur sous forme
-de prescriptions graphiques 38/39. La couche de zonage est obligatoire, mais la
-présence des autres couches dépend du contenu du document d'urbanisme.
-
-Pour couvrir 100 % des cas, la prochaine brique devra utiliser en complément :
-- le règlement structuré CNIG/SRU lorsqu'il est publié ;
-- sinon le règlement écrit de la zone comme fallback ciblé.
+Même ce moteur ne remplace pas une étude de faisabilité complète.
+Les retraits, bandes de constructibilité, pleine terre, stationnement,
+OAP, risques et servitudes peuvent encore réduire le potentiel.
 
 ## Déploiement
 
-Remplacer uniquement `app.py` sur GitHub.
-Le `requirements.txt` de la V3.3.1 reste compatible.
+Remplacer :
+- `app.py`
+- `requirements.txt`
+
+Nouvelle dépendance : `pypdf`.
