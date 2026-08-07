@@ -1,48 +1,39 @@
-# Prospecteur Foncier V3.8 — analyse PLU/PLUi précise par commune
+# Prospecteur Foncier V3.9 — sélection simple Habitat
 
-## Objectif
+Cette version revient volontairement à un moteur simple et stable.
 
-La recherche est désormais recalculée spécifiquement pour la commune sélectionnée.
+## Sélection
+Une parcelle est conservée uniquement si :
+- elle est en zone U ;
+- ou en zone AUc/AU si cette option est choisie ;
+- le PLU/PLUi fournit une indication Habitat/Logement suffisamment claire ;
+- la zone n'est pas à vocation économique ;
+- la parcelle n'est pas déjà identifiée comme logement collectif existant.
 
-## Méthode
+## Identification Habitat
+Le moteur utilise :
+1. DESTOUI / DESTCDT / DESTNON ;
+2. FORMDOMI : 01xx = habitat, 0300 = mixte habitat/activité ;
+3. DESTDOMI : 01 = habitat, 03 = mixte habitat/activité ;
+4. libellés habitat / résidentiel / logement ;
+5. fallback limité aux codes urbains courants UA, UB, UC, UD, UH, UR, UP.
 
-1. Charge le dernier cadastre disponible via le flux Etalab `latest`.
-2. Résout le PLU/PLUi en vigueur sur la commune.
-3. Charge uniquement le `ZONE_URBA` et les prescriptions graphiques de cette commune.
-4. Intersecte **géométriquement chaque parcelle avec toutes les zones PLU/PLUi**.
-5. Élimine avant tout calcul :
-   - zones A ;
-   - zones N ;
-   - zones AUs ;
-   - autres zones non constructibles ;
-   - zones à vocation économique / industrielle / artisanale / logistique ;
-   - secteurs graphiques CNIG `02-01` avec interdiction explicite de constructibilité.
-6. Conserve la géométrie exacte de la partie de parcelle située en zone constructible.
-7. Pour chaque sous-zone constructible :
-   - cherche une prescription CNIG 38-02 d'emprise maximale ;
-   - cherche une prescription CNIG 39-02 de hauteur maximale ;
-   - si nécessaire, utilise le règlement PDF **lié à cette zone graphique** pour récupérer uniquement ces deux valeurs.
-8. Une prescription graphique locale ne s'applique que sur son périmètre réel.
-9. La surface brute est la somme des sous-surfaces :
-   `surface × emprise applicable × niveaux applicables`.
-10. La capacité automatique n'est calculée que si emprise + hauteur couvrent au moins 95 % de la partie constructible de la parcelle.
+Les secteurs d'activités, industrie, commerce, logistique, artisanat, équipements,
+tourisme/loisirs, agriculture et nature sont exclus.
 
-## Ce que cette version ne calcule pas
+## Estimation logements
+- SDP = surface cadastrale × ratio SDP (80 % par défaut)
+- SHAB = SDP × ratio SHAB (80 % par défaut)
+- logements = SHAB / SHAB moyenne par logement (55 m² par défaut)
 
-Volontairement :
-- retraits ;
-- stationnement ;
-- pleine terre ;
-- OAP ;
-- servitudes ;
-- risques.
+## Propriétaires
+Affichage du propriétaire uniquement lorsqu'il s'agit d'une société,
+d'une commune ou d'une autre personne morale disponible dans l'open data DGFiP.
 
-La V3.8 se concentre uniquement sur **emprise au sol + hauteur**, conformément au besoin.
+## Courriers et PDF
+Le modèle de lettre SAGEC et le dossier PDF de sélection sont conservés.
+Le PDF affiche l'estimation simple plutôt qu'un gabarit PLU automatique.
 
 ## Déploiement
-
-Remplacer :
-- `app.py`
-- `requirements.txt`
-
-La lettre SAGEC de la V3.7.4 peut être conservée telle quelle.
+Remplacer uniquement `app.py`.
+Le `requirements.txt` et la lettre de la V3.7.4 restent compatibles.

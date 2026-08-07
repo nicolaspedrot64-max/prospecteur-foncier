@@ -7,4 +7,3 @@ pyproj>=3.6
 pydeck>=0.9
 duckdb>=1.1
 reportlab>=4.2
-pypdf>=5.0
