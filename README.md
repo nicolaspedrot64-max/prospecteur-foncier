@@ -1,21 +1,16 @@
-# Prospecteur Foncier V3 — ratios SDP / SHAB
+# Prospecteur Foncier V5 — Maison individuelle sans contrainte d'emprise
 
-Évolution de la V2 demandée :
+Correction métier par rapport à la V4 :
 
-- suppression du critère de surface minimale de terrain ;
-- conservation du filtre par nombre de logements ;
-- ajout de 3 ratios modifiables :
-  - SDP / surface brute : 80 % par défaut ;
-  - SHAB / SDP : 80 % par défaut ;
-  - SHAB moyenne par logement : 55 m² par défaut ;
-- calcul automatique :
-  - `SDP = surface brute × ratio SDP`
-  - `SHAB = SDP × ratio SHAB`
-  - `Nombre de logements = partie entière(SHAB / SHAB par logement)`
-- affichage de la surface brute, SDP estimée, SHAB estimée et nombre de logements pour chaque parcelle.
+- un terrain nu reste éligible ;
+- une parcelle déjà bâtie reste éligible si la BDNB la qualifie **Résidentiel individuel** ;
+- une grande maison ou villa peut donc être sélectionnée même si elle occupe presque toute la parcelle ;
+- une résidence / un immeuble en **Résidentiel collectif** reste exclu ;
+- le nombre maximum de logements existants est réglable, avec **1 logement par défaut** ;
+- la part de terrain libre est toujours calculée et affichée, mais **n'est plus un filtre d'exclusion** ;
+- une option permet seulement de **prioriser** les maisons ayant plus de terrain libre dans le score.
 
-## Hypothèse provisoire importante
+## Déploiement
 
-Dans cette V3, la surface cadastrale de la parcelle sert encore de base de **surface brute de présélection**.
-La version suivante devra remplacer cette approximation par une vraie surface brute constructible issue du
-gabarit PLU : emprise au sol, nombre de niveaux/hauteur, retraits, pleine terre, prescriptions, OAP, etc.
+Sur GitHub, remplacez uniquement `app.py` par celui de cette V5.
+Le `requirements.txt` de la V4/V3 peut être conservé.

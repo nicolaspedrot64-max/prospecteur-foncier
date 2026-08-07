@@ -62,7 +62,7 @@ REGIONS = {
 }
 
 st.set_page_config(
-    page_title="Prospecteur Foncier V2",
+    page_title="Prospecteur Foncier V5",
     page_icon="🏗️",
     layout="wide",
 )
@@ -70,8 +70,10 @@ st.set_page_config(
 # --------------------------
 # Helpers réseau
 # --------------------------
+BDNB_API = "https://api.bdnb.io/v1/bdnb/donnees/batiment_groupe_complet"
+
 HEADERS = {
-    "User-Agent": "ProspecteurFoncier/2.0 (Streamlit; donnees publiques)",
+    "User-Agent": "ProspecteurFoncier/5.0 (Streamlit; donnees publiques)",
     "Accept": "application/json, application/geo+json, */*",
 }
 
@@ -123,6 +125,168 @@ def fetch_cadastre_layer(insee, layer):
         f"Impossible de télécharger la couche cadastrale '{layer}' pour {insee}: {last_error}"
     )
 
+
+def _as_int(value, default=0):
+    try:
+        if value is None or value == "":
+            return default
+        return int(float(value))
+    except Exception:
+        return default
+
+
+def _normalise_parcelle_id(value):
+    if value is None:
+        return ""
+    return re.sub(r"[^0-9A-Za-z]", "", str(value)).upper()
+
+
+def _parse_parcelle_list(value):
+    """Normalise l_parcelle_id quel que soit son format JSON/Postgres."""
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [_normalise_parcelle_id(v) for v in value if v]
+    if isinstance(value, tuple):
+        return [_normalise_parcelle_id(v) for v in value if v]
+
+    txt = str(value).strip()
+    if not txt:
+        return []
+
+    # Peut arriver sous forme JSON ou tableau PostgreSQL {id1,id2}.
+    try:
+        parsed = json.loads(txt)
+        if isinstance(parsed, list):
+            return [_normalise_parcelle_id(v) for v in parsed if v]
+    except Exception:
+        pass
+
+    txt = txt.strip("{}[]")
+    parts = re.split(r"[,;]", txt)
+    return [_normalise_parcelle_id(p.strip().strip('"').strip("'")) for p in parts if p.strip()]
+
+
+@st.cache_data(ttl=7 * 24 * 3600, show_spinner=False)
+def fetch_bdnb_commune(insee):
+    """
+    Charge une seule fois les caractéristiques bâtiments BDNB de la commune.
+    On évite un appel par parcelle : la requête est paginée puis mise en cache.
+    """
+    select_fields = ",".join(
+        [
+            "batiment_groupe_id",
+            "code_commune_insee",
+            "l_parcelle_id",
+            "usage_principal_bdnb_open",
+            "nb_log",
+            "surface_emprise_sol",
+            "nb_niveau",
+            "libelle_adr_principale_ban",
+        ]
+    )
+
+    rows = []
+    page_size = 1000
+    offset = 0
+    max_pages = 100
+
+    for _ in range(max_pages):
+        params = {
+            "code_commune_insee": f"eq.{insee}",
+            "select": select_fields,
+            "limit": page_size,
+            "offset": offset,
+            "order": "batiment_groupe_id.asc",
+        }
+        r = requests.get(BDNB_API, params=params, headers=HEADERS, timeout=120)
+        r.raise_for_status()
+        page = r.json()
+        if not isinstance(page, list):
+            raise RuntimeError("Réponse BDNB inattendue.")
+
+        rows.extend(page)
+        if len(page) < page_size:
+            break
+        offset += page_size
+
+    return rows
+
+
+def build_bdnb_parcel_index(rows):
+    """Indexe les groupes de bâtiments BDNB par identifiant cadastral."""
+    index = {}
+    for row in rows or []:
+        for pid in _parse_parcelle_list(row.get("l_parcelle_id")):
+            if not pid:
+                continue
+            index.setdefault(pid, []).append(row)
+    return index
+
+
+def classify_existing_buildings(parcel_bdnb_rows):
+    """
+    Une parcelle bâtie n'est qualifiée 'Maison individuelle' que si la BDNB
+    identifie au moins un usage Résidentiel individuel et aucun collectif,
+    tertiaire ou usage indifférencié. Les dépendances sont tolérées.
+    """
+    if not parcel_bdnb_rows:
+        return {
+            "bdnb_disponible": False,
+            "maison_individuelle": False,
+            "type_bati_bdnb": "Bâti non qualifié",
+            "nb_log_existants": 0,
+            "nb_niveaux_existants": 0,
+            "adresse_bdnb": "",
+            "usages_bdnb": "",
+        }
+
+    usages_raw = []
+    nb_log_total = 0
+    nb_niveaux = 0
+    adresse = ""
+
+    for row in parcel_bdnb_rows:
+        usage = str(row.get("usage_principal_bdnb_open") or "").strip()
+        if usage:
+            usages_raw.append(usage)
+        nb_log_total += max(0, _as_int(row.get("nb_log"), 0))
+        nb_niveaux = max(nb_niveaux, _as_int(row.get("nb_niveau"), 0))
+        if not adresse:
+            adresse = str(row.get("libelle_adr_principale_ban") or "").strip()
+
+    usages_norm = {normalize_text(u) for u in usages_raw if u}
+    has_individual = any("residentiel individuel" in u for u in usages_norm)
+    has_collective = any("residentiel collectif" in u for u in usages_norm)
+
+    allowed_aux = {
+        "residentiel individuel",
+        "dependance",
+    }
+    disallowed = any(u not in allowed_aux for u in usages_norm)
+
+    if has_collective:
+        label = "Résidentiel collectif — EXCLU"
+        maison = False
+    elif has_individual and not disallowed:
+        label = "Maison individuelle"
+        maison = True
+    elif has_individual:
+        label = "Maison + autre usage — EXCLU"
+        maison = False
+    else:
+        label = "Autre bâti — EXCLU"
+        maison = False
+
+    return {
+        "bdnb_disponible": True,
+        "maison_individuelle": maison,
+        "type_bati_bdnb": label,
+        "nb_log_existants": nb_log_total,
+        "nb_niveaux_existants": nb_niveaux,
+        "adresse_bdnb": adresse,
+        "usages_bdnb": " / ".join(sorted(set(usages_raw))),
+    }
 
 def gpu_get(layer, params, timeout=90):
     url = f"{GPU_API}/{layer}"
@@ -357,6 +521,7 @@ def analyse_commune(
     parcelles_geojson,
     batiments_geojson,
     zones_geojson,
+    bdnb_parcel_index,
     include_au,
     exclude_non_residential,
     ratio_sdp_pct,
@@ -445,6 +610,17 @@ def analyse_commune(
 
         terrain_bati = built_count > 0
 
+        # Qualification du bâti via la BDNB : maison individuelle vs collectif.
+        raw_ref = pp["id_parcelle"] or f"{insee}-{pp['section']}-{pp['numero']}"
+        ref_norm = _normalise_parcelle_id(raw_ref)
+        bdnb_info = classify_existing_buildings(bdnb_parcel_index.get(ref_norm, []))
+
+        if surface > 0:
+            emprise_existante_pct = min(100.0, max(0.0, (built_footprint / float(surface)) * 100.0))
+        else:
+            emprise_existante_pct = 0.0
+        terrain_libre_pct = max(0.0, 100.0 - emprise_existante_pct)
+
         # Méthode de capacité définie par l'utilisateur :
         # Surface brute -> SDP -> SHAB -> nombre de logements.
         # À ce stade, faute de moteur de gabarit PLU complet, la surface cadastrale
@@ -466,11 +642,14 @@ def analyse_commune(
             score += 5
         if not terrain_bati:
             score += 5
+        elif bdnb_info["maison_individuelle"]:
+            # Une maison individuelle reste intéressante quelle que soit son emprise.
+            score += 5
         if zr["typezone"] == "AU":
             score -= 10
         score = max(0, min(100, score))
 
-        ref = pp["id_parcelle"] or f"{insee}-{pp['section']}-{pp['numero']}"
+        ref = raw_ref
         rows.append(
             {
                 "selection": False,
@@ -489,6 +668,14 @@ def analyse_commune(
                 "terrain_bati": terrain_bati,
                 "nb_batiments": built_count,
                 "emprise_batie_m2": round(built_footprint),
+                "emprise_existante_pct": round(emprise_existante_pct, 1),
+                "terrain_libre_pct": round(terrain_libre_pct, 1),
+                "maison_individuelle": bool(bdnb_info["maison_individuelle"]),
+                "type_bati_bdnb": bdnb_info["type_bati_bdnb"],
+                "usages_bdnb": bdnb_info["usages_bdnb"],
+                "nb_log_existants": int(bdnb_info["nb_log_existants"]),
+                "nb_niveaux_existants": int(bdnb_info["nb_niveaux_existants"]),
+                "bdnb_disponible": bool(bdnb_info["bdnb_disponible"]),
                 "zone_type": zr["typezone"],
                 "zone_plu": zr["libelle"],
                 "zone_description": zr["libelong"],
@@ -499,7 +686,7 @@ def analyse_commune(
                 "score": score,
                 "latitude": rp.y,
                 "longitude": rp.x,
-                "adresse": "",
+                "adresse": bdnb_info["adresse_bdnb"],
             }
         )
         feature_map[ref] = {
@@ -513,6 +700,9 @@ def analyse_commune(
                 "shab_m2": round(shab_estimee),
                 "zone": zr["libelle"],
                 "typezone": zr["typezone"],
+                "type_bati": bdnb_info["type_bati_bdnb"] if terrain_bati else "Terrain nu",
+                "terrain_libre_pct": round(terrain_libre_pct, 1),
+                "nb_log_existants": int(bdnb_info["nb_log_existants"]),
                 "logements": logements,
             },
             "geometry": mapping(pg),
@@ -599,9 +789,9 @@ def generate_letter(row, signataire, fonction, email, ville_signature):
 # --------------------------
 # Interface
 # --------------------------
-st.title("🏗️ Prospecteur Foncier — V2")
+st.title("🏗️ Prospecteur Foncier — V5")
 st.caption(
-    "Cadastre réel + PLU/PLUi + calcul de capacité SDP → SHAB → logements."
+    "Cadastre réel + PLU/PLUi + BDNB : toute maison individuelle peut être retenue, même si elle occupe une grande partie de la parcelle."
 )
 
 st.info(
@@ -708,8 +898,39 @@ with c7:
         help="Filtre les libellés indiquant activité, industrie, logistique, etc.",
     )
 
+
+st.markdown("#### Filtre des parcelles déjà bâties")
+h1, h2 = st.columns(2)
+with h1:
+    max_log_existants = st.number_input(
+        "Nombre maximum de logements déjà présents",
+        min_value=1,
+        max_value=5,
+        value=1,
+        step=1,
+        help=(
+            "Par défaut : 1 seul logement existant. Une grande villa reste donc éligible, "
+            "même si le bâtiment occupe une grande partie de la parcelle."
+        ),
+    )
+with h2:
+    prioriser_grand_terrain = st.checkbox(
+        "Prioriser les maisons avec beaucoup de terrain libre",
+        value=True,
+        help=(
+            "Ce réglage influence seulement le score et le classement. "
+            "Il n'élimine plus une maison individuelle qui occupe presque toute sa parcelle."
+        ),
+    )
+
+st.caption(
+    "Règle V5 : une parcelle bâtie est retenue dès lors que la BDNB la qualifie en résidentiel individuel "
+    "et qu'elle ne dépasse pas le nombre de logements existants choisi. "
+    "Le pourcentage de terrain libre reste affiché, mais n'est plus un critère d'exclusion."
+)
+
 st.warning(
-    "Important : le zonage U/AU permet une présélection réelle, mais une zone U ne garantit pas à elle seule "
+    "Important : le filtre maison/résidence utilise la BDNB et le cadastre. Une grande maison individuelle reste éligible même avec peu de terrain libre. Le zonage U/AU permet une présélection réelle, mais une zone U ne garantit pas à elle seule "
     "qu'un programme de logements soit autorisé. La prochaine brique du logiciel devra lire automatiquement "
     "le règlement écrit de chaque zone (emprise, hauteur, retraits, stationnement, mixité, etc.)."
 )
@@ -725,6 +946,16 @@ if analyse_button:
             parcelles_geojson = fetch_cadastre_layer(insee, "parcelles")
         with st.spinner("Téléchargement des bâtiments cadastraux…"):
             batiments_geojson = fetch_cadastre_layer(insee, "batiments")
+        with st.spinner("Qualification maisons / résidences via la BDNB…"):
+            try:
+                bdnb_rows = fetch_bdnb_commune(insee)
+                bdnb_parcel_index = build_bdnb_parcel_index(bdnb_rows)
+                st.session_state["bdnb_error"] = ""
+            except Exception as bdnb_exc:
+                # Mode conservateur : sans BDNB, les terrains bâtis ne seront pas retenus comme maisons.
+                bdnb_rows = []
+                bdnb_parcel_index = {}
+                st.session_state["bdnb_error"] = str(bdnb_exc)
         with st.spinner("Recherche du document d'urbanisme en vigueur…"):
             commune_geojson = fetch_cadastre_layer(insee, "communes")
             partition, documents = fetch_gpu_document(insee, commune_geojson)
@@ -747,6 +978,7 @@ if analyse_button:
                 parcelles_geojson=parcelles_geojson,
                 batiments_geojson=batiments_geojson,
                 zones_geojson=zones_geojson,
+                bdnb_parcel_index=bdnb_parcel_index,
                 include_au=(zone_mode == "Zones U + AU"),
                 exclude_non_residential=exclude_non_res,
                 ratio_sdp_pct=ratio_sdp_pct,
@@ -775,10 +1007,30 @@ if results is not None and st.session_state.get("analysis_insee") == insee:
         & (results["logements_estimes"] <= max_log)
     ].copy()
 
+    # Règle métier : toute parcelle déjà bâtie doit être une maison individuelle
+    # avec beaucoup de terrain libre. Les résidences collectives sont systématiquement écartées.
+    built_ok = (
+        (filtered["maison_individuelle"] == True)
+        & (filtered["nb_log_existants"] <= int(max_log_existants))
+    )
+    filtered = filtered[(filtered["terrain_bati"] == False) | built_ok].copy()
+
+    # Le terrain libre ne sert plus à exclure les maisons. Il ne sert qu'à les prioriser.
+    if prioriser_grand_terrain and not filtered.empty:
+        bonus = (filtered["terrain_libre_pct"] / 20.0).clip(lower=0, upper=5)
+        house_mask = filtered["terrain_bati"] == True
+        filtered.loc[house_mask, "score"] = (
+            filtered.loc[house_mask, "score"] + bonus.loc[house_mask]
+        ).clip(upper=100).round().astype(int)
+
     if terrain_mode == "Terrain nu":
         filtered = filtered[filtered["terrain_bati"] == False]
     elif terrain_mode == "Terrain bâti":
-        filtered = filtered[filtered["terrain_bati"] == True]
+        filtered = filtered[
+            (filtered["terrain_bati"] == True)
+            & (filtered["maison_individuelle"] == True)
+            & (filtered["nb_log_existants"] <= int(max_log_existants))
+        ]
 
     filtered = filtered.sort_values(
         ["score", "surface_m2"],
@@ -788,12 +1040,19 @@ if results is not None and st.session_state.get("analysis_insee") == insee:
     st.subheader("2. Résultats sur le cadastre réel")
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Parcelles présélectionnées", len(filtered))
-    m2.metric("Parcelles analysées", len(results))
-    m3.metric("Zone urbanisme", st.session_state.get("analysis_partition", "—"))
-    m4.metric(
-        "Surface présélectionnée",
-        f"{int(filtered['surface_m2'].sum()):,} m²".replace(",", " "),
+    m2.metric("Terrains nus", int((filtered["terrain_bati"] == False).sum()))
+    m3.metric(
+        "Maisons individuelles",
+        int(((filtered["terrain_bati"] == True) & (filtered["maison_individuelle"] == True)).sum()),
     )
+    m4.metric("Zone urbanisme", st.session_state.get("analysis_partition", "—"))
+
+    if st.session_state.get("bdnb_error"):
+        st.warning(
+            "La BDNB n'a pas répondu pendant cette analyse. Par sécurité, les parcelles bâties "
+            "ne sont pas qualifiées comme maisons et sont donc exclues. Détail : "
+            + st.session_state["bdnb_error"]
+        )
 
     if filtered.empty:
         st.warning("Aucune parcelle ne correspond aux critères actuels.")
@@ -834,6 +1093,9 @@ if results is not None and st.session_state.get("analysis_insee") == insee:
                         "Surface brute : {surface_m2} m²<br/>"
                         "SDP : {sdp_m2} m²<br/>"
                         "SHAB : {shab_m2} m²<br/>"
+                        "Bâti : {type_bati}<br/>"
+                        "Terrain libre : {terrain_libre_pct} %<br/>"
+                        "Logements existants : {nb_log_existants}<br/>"
                         "Zone : {typezone} {zone}<br/>"
                         "Potentiel : {logements} logements"
                     )
@@ -857,6 +1119,10 @@ if results is not None and st.session_state.get("analysis_insee") == insee:
                 "sdp_estimee_m2",
                 "shab_estimee_m2",
                 "terrain_bati",
+                "type_bati_bdnb",
+                "nb_log_existants",
+                "terrain_libre_pct",
+                "emprise_existante_pct",
                 "nb_batiments",
                 "zone_type",
                 "zone_plu",
@@ -883,6 +1149,10 @@ if results is not None and st.session_state.get("analysis_insee") == insee:
                 "sdp_estimee_m2": st.column_config.NumberColumn("SDP estimée m²"),
                 "shab_estimee_m2": st.column_config.NumberColumn("SHAB estimée m²"),
                 "terrain_bati": st.column_config.CheckboxColumn("Bâti"),
+                "type_bati_bdnb": st.column_config.TextColumn("Type de bâti BDNB"),
+                "nb_log_existants": st.column_config.NumberColumn("Logements existants"),
+                "terrain_libre_pct": st.column_config.NumberColumn("Terrain libre %", format="%.1f %%"),
+                "emprise_existante_pct": st.column_config.NumberColumn("Emprise bâtie %", format="%.1f %%"),
                 "nb_batiments": st.column_config.NumberColumn("Nb bâtiments"),
                 "zone_type": st.column_config.TextColumn("Type zone"),
                 "zone_plu": st.column_config.TextColumn("Zone PLU"),
@@ -902,6 +1172,10 @@ if results is not None and st.session_state.get("analysis_insee") == insee:
                 "sdp_estimee_m2",
                 "shab_estimee_m2",
                 "terrain_bati",
+                "type_bati_bdnb",
+                "nb_log_existants",
+                "terrain_libre_pct",
+                "emprise_existante_pct",
                 "nb_batiments",
                 "zone_type",
                 "zone_plu",
@@ -924,14 +1198,18 @@ if results is not None and st.session_state.get("analysis_insee") == insee:
                 progress = st.progress(0)
                 addresses = {}
                 for i, (_, row) in enumerate(selected.iterrows(), start=1):
-                    try:
-                        addr = reverse_geocode(
-                            float(row["latitude"]),
-                            float(row["longitude"]),
-                            insee,
-                        )
-                    except Exception:
-                        addr = ""
+                    existing_addr = str(row.get("adresse") or "").strip()
+                    if existing_addr:
+                        addr = existing_addr
+                    else:
+                        try:
+                            addr = reverse_geocode(
+                                float(row["latitude"]),
+                                float(row["longitude"]),
+                                insee,
+                            )
+                        except Exception:
+                            addr = ""
                     addresses[row["reference"]] = addr
                     progress.progress(i / len(selected))
                     time.sleep(0.03)
@@ -1007,6 +1285,9 @@ with st.expander("Ce que la V2 analyse réellement"):
 - **PLU / PLUi** : zonages du Géoportail de l'Urbanisme via l'API Carto IGN.
 - **Exclusions** : zones A et N exclues ; zones U analysées ; zones AU optionnelles.
 - **Terrain nu / bâti** : déterminé par croisement spatial avec les bâtiments cadastraux.
+- **Maison vs résidence** : qualification via la BDNB ; les bâtiments résidentiels collectifs sont exclus des terrains bâtis.
+- **Terrain libre** : calculé et affiché à partir de l'emprise cadastrale existante ; utilisé pour prioriser, jamais pour exclure une maison individuelle.
+- **Sécurité** : 1 logement existant par défaut ; les résidences collectives sont exclues ; si la BDNB ne qualifie pas le bâti, la parcelle bâtie est écartée.
 - **Capacité logements** : SDP = surface brute × ratio SDP ; SHAB = SDP × ratio SHAB ; logements = SHAB ÷ ratio SHAB/logement.
 - **Adresse** : recherchée pour les parcelles sélectionnées via le géocodage inverse de la Géoplateforme.
 - **Courrier** : généré à partir du modèle SAGEC fourni.
