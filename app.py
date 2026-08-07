@@ -62,7 +62,7 @@ REGIONS = {
 }
 
 st.set_page_config(
-    page_title="Prospecteur Foncier V3.1",
+    page_title="Prospecteur Foncier V3.2",
     page_icon="🏗️",
     layout="wide",
 )
@@ -73,7 +73,7 @@ st.set_page_config(
 BDNB_API = "https://api.bdnb.io/v1/bdnb/donnees/batiment_groupe_complet"
 
 HEADERS = {
-    "User-Agent": "ProspecteurFoncier/3.1 (Streamlit; donnees publiques)",
+    "User-Agent": "ProspecteurFoncier/3.2 (Streamlit; donnees publiques)",
     "Accept": "application/json, application/geo+json, */*",
 }
 
@@ -399,41 +399,259 @@ NON_RESIDENTIAL_KEYWORDS = [
     "camping",
     "equipement",
     "sport",
+    "tourisme",
+    "loisir",
+    "agricol",
+    "naturel",
 ]
 
-RESIDENTIAL_KEYWORDS = [
+HABITAT_KEYWORDS = [
     "habitat",
+    "habitation",
+    "residentiel",
+    "residentielle",
     "resident",
     "logement",
-    "mixte",
-    "centre",
-    "bourg",
-    "village",
+    "logements",
+    "mixte habitat",
+    "mixte resident",
 ]
+
+# Standard CNIG 2024/2025 :
+# 20 = destination Habitation ; 21 = sous-destination Logement ; 22 = Hébergement.
+DESTINATION_CODES = [
+    "10", "11", "12",
+    "20", "21", "22",
+    "30", "31", "32", "33", "34", "35", "36", "37",
+    "40", "41", "42", "43", "44", "45", "46", "47",
+    "50", "51", "52", "53", "54", "55",
+    "99",
+]
+
+
+def parse_destination_codes(value):
+    """
+    Extrait les codes CNIG de destination/sous-destination.
+    Fonctionne avec des listes séparées ou des chaînes compactées.
+    """
+    if value is None:
+        return set()
+
+    if isinstance(value, (list, tuple, set)):
+        txt = " ".join(str(x) for x in value)
+    else:
+        txt = str(value)
+
+    found = set()
+    i = 0
+    while i < len(txt):
+        matched = False
+        for c in DESTINATION_CODES:
+            if txt.startswith(c, i):
+                found.add(c)
+                i += len(c)
+                matched = True
+                break
+        if not matched:
+            i += 1
+    return found
+
+
+def _normalise_typezone(typezone):
+    t = str(typezone or "").strip()
+    if not t:
+        return ""
+    # Conserver la casse utile pour AUc/AUs
+    tu = t.upper()
+    if tu == "U":
+        return "U"
+    if tu == "AUC":
+        return "AUc"
+    if tu == "AUS":
+        return "AUs"
+    if tu == "AU":
+        # Données plus anciennes : AU générique, traité comme zone à urbaniser conditionnelle.
+        return "AU"
+    if tu == "A":
+        return "A"
+    if tu == "N":
+        return "N"
+    return t
+
+
+def analyse_habitat_zone(props, include_au=True, include_conditionnel=True):
+    """
+    Moteur Habitat à haute précision.
+
+    Ordre de preuve :
+    1) données structurées CNIG récentes DESTOUI / DESTCDT / DESTNON ;
+    2) ancien attribut DESTDOMI (01 habitat, 03 mixte habitat/activité) ;
+    3) libellé / nom long de la zone ;
+    4) si aucune preuve explicite : zone classée "indéterminée", donc rejetée en mode strict.
+    """
+    raw_typezone = props.get("typezone")
+    typezone = _normalise_typezone(raw_typezone)
+
+    libelle = str(props.get("libelle") or "")
+    libelong = str(props.get("libelong") or "")
+    destdomi = str(props.get("destdomi") or "").strip()
+    destoui_raw = props.get("destoui")
+    destcdt_raw = props.get("destcdt")
+    destnon_raw = props.get("destnon")
+
+    text = normalize_text(" ".join([libelle, libelong]))
+
+    destoui = parse_destination_codes(destoui_raw)
+    destcdt = parse_destination_codes(destcdt_raw)
+    destnon = parse_destination_codes(destnon_raw)
+
+    # 0. Type de zone : on exclut les zones non immédiatement destinées à bâtir du logement.
+    if typezone in {"A", "N"}:
+        return {
+            "habitat_eligible": False,
+            "habitat_statut": "Exclue — zone agricole/naturelle",
+            "habitat_preuve": f"TYPEZONE={typezone}",
+            "habitat_confiance": 100,
+            "typezone_normalise": typezone,
+        }
+
+    if typezone == "AUs":
+        return {
+            "habitat_eligible": False,
+            "habitat_statut": "Exclue — zone AU bloquée",
+            "habitat_preuve": "TYPEZONE=AUs : ouverture subordonnée à modification/révision du PLU",
+            "habitat_confiance": 100,
+            "typezone_normalise": typezone,
+        }
+
+    if typezone in {"AUc", "AU"} and not include_au:
+        return {
+            "habitat_eligible": False,
+            "habitat_statut": "Exclue — zone AU désactivée dans les critères",
+            "habitat_preuve": f"TYPEZONE={typezone}",
+            "habitat_confiance": 100,
+            "typezone_normalise": typezone,
+        }
+
+    # 1. Standards CNIG récents : destination Habitation / Logement.
+    housing_codes = {"20", "21"}
+
+    # Interdiction explicite prioritaire lorsqu'aucune autorisation explicite ne la contredit.
+    if (destnon & housing_codes) and not (destoui & housing_codes) and not (destcdt & housing_codes):
+        return {
+            "habitat_eligible": False,
+            "habitat_statut": "Exclue — logement/habitation interdit",
+            "habitat_preuve": f"DESTNON={','.join(sorted(destnon & housing_codes))}",
+            "habitat_confiance": 100,
+            "typezone_normalise": typezone,
+        }
+
+    if destoui & housing_codes:
+        return {
+            "habitat_eligible": True,
+            "habitat_statut": "Habitat autorisé",
+            "habitat_preuve": f"DESTOUI={','.join(sorted(destoui & housing_codes))}",
+            "habitat_confiance": 100,
+            "typezone_normalise": typezone,
+        }
+
+    if destcdt & housing_codes:
+        if include_conditionnel:
+            return {
+                "habitat_eligible": True,
+                "habitat_statut": "Habitat autorisé sous conditions",
+                "habitat_preuve": f"DESTCDT={','.join(sorted(destcdt & housing_codes))}",
+                "habitat_confiance": 90,
+                "typezone_normalise": typezone,
+            }
+        return {
+            "habitat_eligible": False,
+            "habitat_statut": "Exclue — habitat seulement sous conditions",
+            "habitat_preuve": f"DESTCDT={','.join(sorted(destcdt & housing_codes))}",
+            "habitat_confiance": 90,
+            "typezone_normalise": typezone,
+        }
+
+    # Si les champs DEST* sont renseignés mais ne contiennent ni Habitation ni Logement,
+    # on considère qu'il n'y a pas de preuve de destination logement.
+    if destoui or destcdt or destnon:
+        return {
+            "habitat_eligible": False,
+            "habitat_statut": "Exclue — destination logement non identifiée",
+            "habitat_preuve": (
+                f"DESTOUI={','.join(sorted(destoui)) or '—'} ; "
+                f"DESTCDT={','.join(sorted(destcdt)) or '—'} ; "
+                f"DESTNON={','.join(sorted(destnon)) or '—'}"
+            ),
+            "habitat_confiance": 95,
+            "typezone_normalise": typezone,
+        }
+
+    # 2. Ancien standard CNIG : vocation dominante.
+    # 01 = habitat ; 03 = mixte habitat/activité.
+    dd = re.sub(r"\D", "", destdomi)
+    if dd in {"1", "01"}:
+        return {
+            "habitat_eligible": True,
+            "habitat_statut": "Habitat — vocation dominante",
+            "habitat_preuve": "DESTDOMI=01 (habitat)",
+            "habitat_confiance": 95,
+            "typezone_normalise": typezone,
+        }
+    if dd in {"3", "03"}:
+        return {
+            "habitat_eligible": True,
+            "habitat_statut": "Habitat/mixte — vocation dominante",
+            "habitat_preuve": "DESTDOMI=03 (mixte habitat/activité)",
+            "habitat_confiance": 90,
+            "typezone_normalise": typezone,
+        }
+    if dd in {"2", "02", "4", "04", "5", "05", "7", "07", "8", "08", "9", "09", "10"}:
+        return {
+            "habitat_eligible": False,
+            "habitat_statut": "Exclue — vocation dominante non habitat",
+            "habitat_preuve": f"DESTDOMI={destdomi}",
+            "habitat_confiance": 95,
+            "typezone_normalise": typezone,
+        }
+
+    # 3. Analyse sémantique du libellé et du nom long.
+    positive = any(k in text for k in HABITAT_KEYWORDS)
+    negative = any(k in text for k in NON_RESIDENTIAL_KEYWORDS)
+
+    if positive and not negative:
+        return {
+            "habitat_eligible": True,
+            "habitat_statut": "Habitat probable — libellé PLU explicite",
+            "habitat_preuve": f"{libelle} — {libelong}".strip(" —"),
+            "habitat_confiance": 80,
+            "typezone_normalise": typezone,
+        }
+
+    if negative and not positive:
+        return {
+            "habitat_eligible": False,
+            "habitat_statut": "Exclue — libellé PLU non résidentiel",
+            "habitat_preuve": f"{libelle} — {libelong}".strip(" —"),
+            "habitat_confiance": 80,
+            "typezone_normalise": typezone,
+        }
+
+    # 4. Haute précision : en mode Habitat strict, une zone sans preuve explicite
+    # n'est pas retenue. Cela réduit les faux positifs.
+    return {
+        "habitat_eligible": False,
+        "habitat_statut": "Exclue — destination habitat non prouvée",
+        "habitat_preuve": f"{libelle} — {libelong}".strip(" —") or "Métadonnées PLU insuffisantes",
+        "habitat_confiance": 60,
+        "typezone_normalise": typezone,
+    }
 
 
 def classify_zone(props):
-    typezone = str(props.get("typezone") or "").upper().strip()
-    text = normalize_text(
-        " ".join(
-            str(props.get(k) or "")
-            for k in ["libelle", "libelong", "destdomi"]
-        )
-    )
-
-    if typezone in {"A", "N"}:
-        return "Non constructible logement", False
-    if typezone == "AU":
-        if any(k in text for k in NON_RESIDENTIAL_KEYWORDS):
-            return "AU non résidentiel probable", False
-        return "À urbaniser — à vérifier", True
-    if typezone == "U":
-        if any(k in text for k in NON_RESIDENTIAL_KEYWORDS):
-            return "U non résidentiel probable", False
-        if any(k in text for k in RESIDENTIAL_KEYWORDS):
-            return "U habitat/mixte probable", True
-        return "U — règlement à vérifier", True
-    return f"Zone {typezone or '?'} — à vérifier", False
+    """Compatibilité avec quelques affichages historiques de l'application."""
+    a = analyse_habitat_zone(props, include_au=True, include_conditionnel=True)
+    return a["habitat_statut"], a["habitat_eligible"]
 
 
 def parcel_properties(feature):
@@ -464,7 +682,8 @@ def analyse_commune(
     zones_geojson,
     bdnb_parcel_index,
     include_au,
-    exclude_non_residential,
+    habitat_only,
+    include_conditionnel,
     ratio_sdp_pct,
     ratio_shab_pct,
     shab_par_logement,
@@ -476,12 +695,21 @@ def analyse_commune(
         if zg is None:
             continue
         props = zf.get("properties", {}) or {}
-        zone_class, residential_candidate = classify_zone(props)
-        typezone = str(props.get("typezone") or "").upper().strip()
+        habitat = analyse_habitat_zone(
+            props,
+            include_au=include_au,
+            include_conditionnel=include_conditionnel,
+        )
+        typezone = habitat["typezone_normalise"]
 
-        allowed = typezone == "U" or (include_au and typezone == "AU")
-        if exclude_non_residential and not residential_candidate:
-            allowed = False
+        # Sans filtre Habitat, on conserve U et AUc/AU, mais jamais A, N ou AUs.
+        base_constructible = (
+            typezone == "U"
+            or (include_au and typezone in {"AUc", "AU"})
+        )
+        allowed = base_constructible
+        if habitat_only:
+            allowed = allowed and habitat["habitat_eligible"]
 
         zone_rows.append(
             {
@@ -491,7 +719,14 @@ def analyse_commune(
                 "libelle": props.get("libelle") or "",
                 "libelong": props.get("libelong") or "",
                 "destdomi": props.get("destdomi") or "",
-                "zone_class": zone_class,
+                "destoui": props.get("destoui") or "",
+                "destcdt": props.get("destcdt") or "",
+                "destnon": props.get("destnon") or "",
+                "zone_class": habitat["habitat_statut"],
+                "habitat_eligible": habitat["habitat_eligible"],
+                "habitat_statut": habitat["habitat_statut"],
+                "habitat_preuve": habitat["habitat_preuve"],
+                "habitat_confiance": habitat["habitat_confiance"],
                 "url_reglement": props.get("urlfic") or "",
                 "datvalid": props.get("datvalid") or props.get("datappro") or "",
             }
@@ -605,6 +840,14 @@ def analyse_commune(
                 "zone_plu": zr["libelle"],
                 "zone_description": zr["libelong"],
                 "classe_zone": zr["zone_class"],
+                "habitat_eligible": bool(zr["habitat_eligible"]),
+                "habitat_statut": zr["habitat_statut"],
+                "habitat_preuve": zr["habitat_preuve"],
+                "habitat_confiance": int(zr["habitat_confiance"]),
+                "destoui": zr["destoui"],
+                "destcdt": zr["destcdt"],
+                "destnon": zr["destnon"],
+                "destdomi": zr["destdomi"],
                 "reglement_url": zr["url_reglement"],
                 "date_zone": zr["datvalid"],
                 "logements_estimes": logements,
@@ -625,6 +868,8 @@ def analyse_commune(
                 "shab_m2": round(shab_estimee),
                 "zone": zr["libelle"],
                 "typezone": zr["typezone"],
+                "habitat": zr["habitat_statut"],
+                "confiance_habitat": zr["habitat_confiance"],
                 "collectif": "Oui" if bdnb_info["collectif_existant"] else "Non",
                 "logements": logements,
             },
@@ -712,9 +957,9 @@ def generate_letter(row, signataire, fonction, email, ville_signature):
 # --------------------------
 # Interface
 # --------------------------
-st.title("🏗️ Prospecteur Foncier — V3.1")
+st.title("🏗️ Prospecteur Foncier — V3.2 — Filtre Habitat")
 st.caption(
-    "Cadastre réel + PLU/PLUi + calcul SDP/SHAB + exclusion des parcelles déjà occupées par du logement collectif."
+    "Cadastre réel + PLU/PLUi + filtre Habitat renforcé + calcul SDP/SHAB + exclusion du collectif existant."
 )
 
 st.info(
@@ -806,8 +1051,11 @@ c5, c6, c7 = st.columns(3)
 with c5:
     zone_mode = st.selectbox(
         "Zones à analyser",
-        ["Zones U uniquement", "Zones U + AU"],
-        help="Les zones A et N sont automatiquement éliminées.",
+        ["Zones U uniquement", "Zones U + AUc constructibles"],
+        help=(
+            "Les zones A et N sont éliminées. Les zones AUs (à urbaniser bloquées) "
+            "sont également éliminées automatiquement."
+        ),
     )
 with c6:
     terrain_mode = st.selectbox(
@@ -815,12 +1063,30 @@ with c6:
         ["Indifférent", "Terrain nu", "Terrain bâti"],
     )
 with c7:
-    exclude_non_res = st.checkbox(
-        "Écarter les zones U/AU manifestement non résidentielles",
+    habitat_only = st.checkbox(
+        "Conserver uniquement les parcelles destinées à l'habitat",
         value=True,
-        help="Filtre les libellés indiquant activité, industrie, logistique, etc.",
+        help=(
+            "Filtre haute précision utilisant les destinations CNIG du PLU/PLUi, "
+            "l'ancienne vocation dominante et les libellés de zone."
+        ),
     )
 
+h1, h2 = st.columns(2)
+with h1:
+    include_conditionnel = st.checkbox(
+        "Inclure l'habitat autorisé sous conditions",
+        value=True,
+        help=(
+            "Conserve les zones dont le standard CNIG indique Habitation/Logement "
+            "dans DESTCDT (destination autorisée sous conditions)."
+        ),
+    )
+with h2:
+    st.info(
+        "Mode strict : si le PLU ne fournit pas de preuve suffisamment explicite que le logement "
+        "est autorisé, la zone est écartée."
+    )
 
 st.caption(
     "Filtre bâti : une parcelle déjà construite reste éligible, sauf si la BDNB identifie "
@@ -828,9 +1094,10 @@ st.caption(
 )
 
 st.warning(
-    "Important : le zonage U/AU permet une présélection réelle, mais une zone U ne garantit pas à elle seule "
-    "qu'un programme de logements soit autorisé. La prochaine brique du logiciel devra lire automatiquement "
-    "le règlement écrit de chaque zone (emprise, hauteur, retraits, stationnement, mixité, etc.)."
+    "Le filtre Habitat réduit fortement les faux positifs : il exploite d'abord les champs structurés "
+    "DESTOUI / DESTCDT / DESTNON du standard CNIG, puis DESTDOMI pour les anciens PLU et enfin "
+    "les libellés explicites de zone. Les règles de gabarit (hauteur, retraits, emprise, stationnement, "
+    "OAP, prescriptions et servitudes) restent à vérifier pour la faisabilité détaillée."
 )
 
 analyse_button = st.button(
@@ -875,8 +1142,9 @@ if analyse_button:
                 batiments_geojson=batiments_geojson,
                 zones_geojson=zones_geojson,
                 bdnb_parcel_index=bdnb_parcel_index,
-                include_au=(zone_mode == "Zones U + AU"),
-                exclude_non_residential=exclude_non_res,
+                include_au=(zone_mode == "Zones U + AUc constructibles"),
+                habitat_only=habitat_only,
+                include_conditionnel=include_conditionnel,
                 ratio_sdp_pct=ratio_sdp_pct,
                 ratio_shab_pct=ratio_shab_pct,
                 shab_par_logement=shab_par_logement,
@@ -903,7 +1171,11 @@ if results is not None and st.session_state.get("analysis_insee") == insee:
         & (results["logements_estimes"] <= max_log)
     ].copy()
 
-    # Règle métier : on élimine uniquement les parcelles sur lesquelles
+    # Filtre Habitat haute précision.
+    if habitat_only:
+        filtered = filtered[filtered["habitat_eligible"] == True].copy()
+
+    # Règle métier : on élimine les parcelles sur lesquelles
     # la BDNB identifie déjà du logement collectif.
     filtered = filtered[filtered["collectif_existant"] == False].copy()
 
@@ -919,13 +1191,13 @@ if results is not None and st.session_state.get("analysis_insee") == insee:
 
     st.subheader("2. Résultats sur le cadastre réel")
     m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Parcelles présélectionnées", len(filtered))
+    m1.metric("Parcelles retenues", len(filtered))
     m2.metric("Parcelles analysées", len(results))
-    m3.metric("Zone urbanisme", st.session_state.get("analysis_partition", "—"))
-    m4.metric(
-        "Surface présélectionnée",
-        f"{int(filtered['surface_m2'].sum()):,} m²".replace(",", " "),
+    m3.metric(
+        "Habitat confirmé / probable",
+        int(filtered["habitat_eligible"].sum()) if "habitat_eligible" in filtered.columns else 0,
     )
+    m4.metric("Document urbanisme", st.session_state.get("analysis_partition", "—"))
 
     if st.session_state.get("bdnb_error"):
         st.warning(
@@ -973,6 +1245,8 @@ if results is not None and st.session_state.get("analysis_insee") == insee:
                         "Surface brute : {surface_m2} m²<br/>"
                         "SDP : {sdp_m2} m²<br/>"
                         "SHAB : {shab_m2} m²<br/>"
+                        "Habitat : {habitat}<br/>"
+                        "Confiance habitat : {confiance_habitat} %<br/>"
                         "Collectif existant : {collectif}<br/>"
                         "Zone : {typezone} {zone}<br/>"
                         "Potentiel : {logements} logements"
@@ -1002,6 +1276,9 @@ if results is not None and st.session_state.get("analysis_insee") == insee:
                 "nb_batiments",
                 "zone_type",
                 "zone_plu",
+                "habitat_statut",
+                "habitat_preuve",
+                "habitat_confiance",
                 "classe_zone",
                 "logements_estimes",
                 "score",
@@ -1030,6 +1307,11 @@ if results is not None and st.session_state.get("analysis_insee") == insee:
                 "nb_batiments": st.column_config.NumberColumn("Nb bâtiments"),
                 "zone_type": st.column_config.TextColumn("Type zone"),
                 "zone_plu": st.column_config.TextColumn("Zone PLU"),
+                "habitat_statut": st.column_config.TextColumn("Statut habitat"),
+                "habitat_preuve": st.column_config.TextColumn("Preuve habitat"),
+                "habitat_confiance": st.column_config.ProgressColumn(
+                    "Confiance habitat", min_value=0, max_value=100
+                ),
                 "classe_zone": st.column_config.TextColumn("Qualification"),
                 "logements_estimes": st.column_config.NumberColumn("Logements estimés"),
                 "score": st.column_config.ProgressColumn("Score", min_value=0, max_value=100),
@@ -1051,6 +1333,9 @@ if results is not None and st.session_state.get("analysis_insee") == insee:
                 "nb_batiments",
                 "zone_type",
                 "zone_plu",
+                "habitat_statut",
+                "habitat_preuve",
+                "habitat_confiance",
                 "classe_zone",
                 "logements_estimes",
                 "score",
@@ -1155,7 +1440,10 @@ with st.expander("Ce que la V2 analyse réellement"):
 - **Communes** : chargées dynamiquement pour la Nouvelle-Aquitaine et l'Occitanie.
 - **Cadastre** : parcelles et bâtiments réels du dernier millésime Etalab.
 - **PLU / PLUi** : zonages du Géoportail de l'Urbanisme via l'API Carto IGN.
-- **Exclusions** : zones A et N exclues ; zones U analysées ; zones AU optionnelles.
+- **Filtre Habitat structuré** : lecture des champs CNIG `DESTOUI`, `DESTCDT`, `DESTNON` ; les codes 20/21 correspondent à Habitation/Logement.
+- **Compatibilité anciens PLU** : lecture de `DESTDOMI` (01 habitat ; 03 mixte habitat/activité) puis analyse des libellés explicites.
+- **Exclusions de zonage** : A, N et AUs sont écartées ; U et AUc sont analysées selon la destination logement.
+- **Mode haute précision** : une zone ambiguë sans preuve explicite d'habitat est exclue.
 - **Terrain nu / bâti** : déterminé par croisement spatial avec les bâtiments cadastraux.
 - **Collectif existant** : les parcelles identifiées par la BDNB comme déjà occupées par du « Résidentiel collectif » sont exclues.
 - **Autres parcelles bâties** : elles restent éligibles, quelle que soit la taille ou l'emprise du bâtiment.
@@ -1164,9 +1452,9 @@ with st.expander("Ce que la V2 analyse réellement"):
 - **Courrier** : généré à partir du modèle SAGEC fourni.
 
 ### Limite actuelle
-Le logiciel ne lit pas encore automatiquement chaque article du règlement écrit du PLU. Le nombre de
-logements est donc une estimation de **présélection** fondée sur une hypothèse de densité. La prochaine
-version devra extraire du règlement : emprise au sol, hauteur, retraits, pleine terre, stationnement,
-destinations autorisées et prescriptions particulières.
+Le filtre Habitat exploite désormais les destinations structurées du PLU lorsqu'elles sont disponibles.
+Il ne remplace toutefois pas une faisabilité complète : le nombre de logements reste une estimation de
+**présélection**. Une prochaine version pourra extraire automatiquement du règlement : emprise au sol,
+hauteur, retraits, pleine terre, stationnement, OAP, prescriptions et servitudes.
         """
     )
