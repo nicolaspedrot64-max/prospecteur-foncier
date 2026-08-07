@@ -73,7 +73,7 @@ REGIONS = {
 }
 
 st.set_page_config(
-    page_title="Prospecteur Foncier V3.3",
+    page_title="Prospecteur Foncier V3.3.1",
     page_icon="🏗️",
     layout="wide",
 )
@@ -84,7 +84,7 @@ st.set_page_config(
 BDNB_API = "https://api.bdnb.io/v1/bdnb/donnees/batiment_groupe_complet"
 
 HEADERS = {
-    "User-Agent": "ProspecteurFoncier/3.3 (Streamlit; donnees publiques)",
+    "User-Agent": "ProspecteurFoncier/3.3.1 (Streamlit; donnees publiques)",
     "Accept": "application/json, application/geo+json, */*",
 }
 
@@ -101,7 +101,7 @@ def fetch_communes(dept_code):
     data = http_get_json(
         url,
         params={
-            "fields": "nom,code,codesPostaux,population",
+            "fields": "nom,code,codeEpci,codesPostaux,population",
             "format": "json",
         },
         timeout=30,
@@ -499,70 +499,144 @@ def enrich_with_personnes_morales(df, insee, owner_index):
     return df
 
 def gpu_get(layer, params, timeout=90):
+    """
+    Appel robuste à l'API Carto GPU.
+    Les erreurs 500/502/503/504 sont parfois temporaires : on réessaie avant abandon.
+    """
     url = f"{GPU_API}/{layer}"
-    r = requests.get(url, params=params, headers=HEADERS, timeout=timeout)
-    if r.ok:
-        return r.json()
+    last_error = None
 
-    # Certaines requêtes géométriques sont mieux acceptées en POST.
-    r2 = requests.post(url, json=params, headers=HEADERS, timeout=timeout)
-    r2.raise_for_status()
-    return r2.json()
+    # GET est la voie principale documentée.
+    for attempt in range(3):
+        try:
+            r = requests.get(url, params=params, headers=HEADERS, timeout=timeout)
+            if r.ok:
+                return r.json()
 
+            last_error = requests.HTTPError(
+                f"{r.status_code} {r.reason} pour {r.url}",
+                response=r,
+            )
+            if r.status_code not in {429, 500, 502, 503, 504}:
+                break
+        except Exception as exc:
+            last_error = exc
 
-@st.cache_data(ttl=6 * 3600, show_spinner=False)
-def fetch_gpu_document(insee, commune_geojson):
-    features = commune_geojson.get("features", [])
-    if not features:
-        return None, []
+        time.sleep(0.7 * (attempt + 1))
 
-    commune_geom = shape(features[0]["geometry"])
-    point = commune_geom.representative_point()
-    geom = json.dumps(mapping(point), separators=(",", ":"))
-
-    data = gpu_get("document", {"geom": geom})
-    docs = data.get("features", []) or []
-
-    # Retirer les documents non opérationnels pour le zonage local si possible.
-    local_docs = []
-    for f in docs:
-        p = f.get("properties", {}) or {}
-        typedoc = str(p.get("typedoc") or p.get("type_doc") or "").upper()
-        if "SCOT" in typedoc:
-            continue
-        local_docs.append(f)
-
-    candidates = local_docs or docs
-    if not candidates:
-        # Fallback utile pour de nombreux PLU communaux.
-        return f"DU_{insee}", []
-
-    def doc_sort_key(f):
-        p = f.get("properties", {}) or {}
-        d = (
-            p.get("datvalid")
-            or p.get("datappro")
-            or p.get("date_appro")
-            or p.get("datefin")
-            or ""
+    # Certaines requêtes géométriques peuvent fonctionner en POST lorsque GET échoue.
+    try:
+        r2 = requests.post(url, json=params, headers=HEADERS, timeout=timeout)
+        if r2.ok:
+            return r2.json()
+        last_error = requests.HTTPError(
+            f"{r2.status_code} {r2.reason} pour {r2.url}",
+            response=r2,
         )
-        return str(d)
+    except Exception as exc:
+        last_error = exc
 
-    candidates = sorted(candidates, key=doc_sort_key, reverse=True)
-    props = candidates[0].get("properties", {}) or {}
-    partition = props.get("partition")
-    if not partition:
-        partition = f"DU_{insee}"
-    return partition, candidates
+    if isinstance(last_error, Exception):
+        raise last_error
+    raise RuntimeError(f"Échec de l'appel GPU {layer}")
 
 
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
-def fetch_gpu_zones(partition):
+def fetch_gpu_document(insee, commune_geojson, code_epci=None):
+    """
+    Résout le document d'urbanisme en vigueur.
+
+    1. Essaie l'intersection ponctuelle /gpu/document?geom=...
+    2. Si ce service renvoie une erreur (ex. HTTP 500), teste directement les
+       partitions normalisées GPU :
+       - DU_<code EPCI> pour un PLUi ;
+       - DU_<code INSEE> pour un PLU communal.
+
+    Le second chemin évite qu'une panne du seul endpoint /document bloque toute l'application.
+    """
+    errors = []
+
+    # 1) Recherche géométrique normale.
+    features = commune_geojson.get("features", [])
+    if features:
+        try:
+            commune_geom = shape(features[0]["geometry"])
+            point = commune_geom.representative_point()
+            geom = json.dumps(mapping(point), separators=(",", ":"))
+
+            data = gpu_get("document", {"geom": geom})
+            docs = data.get("features", []) or []
+
+            local_docs = []
+            for f in docs:
+                p = f.get("properties", {}) or {}
+                typedoc = str(p.get("typedoc") or p.get("type_doc") or "").upper()
+                if "SCOT" in typedoc:
+                    continue
+                local_docs.append(f)
+
+            candidates = local_docs or docs
+            if candidates:
+                def doc_sort_key(f):
+                    p = f.get("properties", {}) or {}
+                    d = (
+                        p.get("datvalid")
+                        or p.get("datappro")
+                        or p.get("date_appro")
+                        or p.get("datefin")
+                        or ""
+                    )
+                    return str(d)
+
+                candidates = sorted(candidates, key=doc_sort_key, reverse=True)
+                props = candidates[0].get("properties", {}) or {}
+                partition = props.get("partition")
+                if partition:
+                    return partition, candidates
+        except Exception as exc:
+            errors.append(f"recherche géométrique: {exc}")
+
+    # 2) Fallback par partitions. Pour les PLUi, le GPU utilise DU_<SIREN EPCI>.
+    partition_candidates = []
+    if code_epci:
+        partition_candidates.append(f"DU_{code_epci}")
+    partition_candidates.append(f"DU_{insee}")
+
+    seen = set()
+    for partition in partition_candidates:
+        if not partition or partition in seen:
+            continue
+        seen.add(partition)
+
+        try:
+            # On filtre déjà sur la commune pour éviter de charger tout le PLUi.
+            probe = gpu_get(
+                "zone-urba",
+                {"partition": partition, "insee": str(insee)},
+                timeout=90,
+            )
+            feats = probe.get("features", []) or []
+            if feats:
+                return partition, []
+        except Exception as exc:
+            errors.append(f"{partition}: {exc}")
+
+    details = " | ".join(errors[-4:]) if errors else "aucun zonage trouvé"
+    raise RuntimeError(
+        "Impossible de résoudre le document PLU/PLUi. "
+        f"Partitions testées : {', '.join(partition_candidates)}. Détail : {details}"
+    )
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def fetch_gpu_zones(partition, insee=None):
     # API GPU : limite haute de plusieurs milliers d'objets.
     all_features = []
     start = 0
     while True:
         params = {"partition": partition}
+        if insee:
+            params["insee"] = str(insee)
         if start:
             params["_start"] = start
 
@@ -1381,7 +1455,7 @@ def generate_letter(row, signataire, fonction, email, ville_signature):
 # --------------------------
 # Interface
 # --------------------------
-st.title("🏗️ Prospecteur Foncier — V3.3 — Prospection foncière")
+st.title("🏗️ Prospecteur Foncier — V3.3.1 — Prospection foncière")
 st.caption(
     "Cadastre réel + PLU/PLUi + exclusion des secteurs économiques + propriétaires personnes morales + calcul SDP/SHAB."
 )
@@ -1426,6 +1500,7 @@ with st.sidebar:
     commune = commune_labels[commune_label]
     commune_name = commune["nom"]
     insee = commune["code"]
+    code_epci = commune.get("codeEpci")
 
 st.subheader("1. Critères de recherche")
 
@@ -1531,15 +1606,19 @@ if analyse_button:
                 st.session_state["bdnb_error"] = str(bdnb_exc)
         with st.spinner("Recherche du document d'urbanisme en vigueur…"):
             commune_geojson = fetch_cadastre_layer(insee, "communes")
-            partition, documents = fetch_gpu_document(insee, commune_geojson)
+            partition, documents = fetch_gpu_document(
+                insee,
+                commune_geojson,
+                code_epci=code_epci,
+            )
         with st.spinner(f"Chargement du zonage PLU/PLUi ({partition})…"):
-            zones_geojson = fetch_gpu_zones(partition)
+            zones_geojson = fetch_gpu_zones(partition, insee=insee)
 
         if not zones_geojson.get("features"):
             municipality = fetch_gpu_municipality(insee)
             st.error(
-                "Aucun zonage PLU/PLUi exploitable n'a été renvoyé par le Géoportail de l'Urbanisme "
-                f"pour cette commune. Partition testée : {partition}."
+                "Aucun zonage PLU/PLUi exploitable n'a été renvoyé pour cette commune. "
+                f"Partition résolue : {partition}. Code EPCI : {code_epci or 'non disponible'}."
             )
             st.json(municipality)
             st.stop()
@@ -1648,6 +1727,13 @@ if results is not None and st.session_state.get("analysis_insee") == insee:
         int(filtered["habitat_eligible"].sum()) if "habitat_eligible" in filtered.columns else 0,
     )
     m4.metric("Document urbanisme", st.session_state.get("analysis_partition", "—"))
+
+    if st.session_state.get("analysis_partition", "").startswith("DU_") and code_epci:
+        if st.session_state.get("analysis_partition") == f"DU_{code_epci}":
+            st.caption(
+                "Document détecté comme PLUi intercommunal via le code EPCI "
+                f"{code_epci}. Le zonage affiché est filtré sur la commune {insee}."
+            )
 
     if st.session_state.get("bdnb_error"):
         st.warning(

@@ -1,31 +1,34 @@
-# Prospecteur Foncier V3.3 — propriétaires personnes morales
+# Prospecteur Foncier V3.3.1 — correctif API GPU / PLUi
 
-## Changements
+Cette version corrige le plantage HTTP 500 observé sur Capbreton lors de l'appel :
 
-1. Le filtre visible « Conserver uniquement les parcelles destinées à l'habitat » est supprimé.
-2. L'exclusion des secteurs à vocation d'activités économiques reste active.
-3. Le logiciel tente maintenant d'identifier le propriétaire lorsqu'il s'agit d'une
-   **personne morale** : société, SCI, collectivité, commune, etc.
-4. Le tableau affiche :
-   - nom / dénomination ;
-   - type de propriétaire ;
-   - forme juridique ;
-   - SIREN lorsqu'il est fourni par la source.
+`/api/gpu/document?geom=...`
 
-## Source propriétaires
+## Pourquoi Capbreton posait problème
 
-Le rapprochement utilise le jeu open data DGFiP « Fichiers des locaux et des parcelles
-des personnes morales », via la version unifiée au format Parquet publiée sur data.gouv.fr.
+Capbreton est couvert par le PLUi de la Communauté de communes Maremne Adour Côte-Sud (MACS).
+Un PLUi est stocké dans le Géoportail de l'Urbanisme sous une partition de type :
 
-Les propriétaires personnes physiques ne sont volontairement pas identifiés : si aucune
-personne morale n'est trouvée, le champ reste vide.
+`DU_<SIREN EPCI>`
 
-## Important pour le déploiement
+La V3.3 dépendait trop du endpoint `/document?geom`. Si celui-ci renvoyait une erreur 500,
+l'analyse s'arrêtait.
 
-Cette version ajoute la dépendance `duckdb`.
+## Correctif
 
-Sur GitHub, remplacez donc :
-- `app.py`
-- `requirements.txt`
+La V3.3.1 :
 
-Puis faites Commit changes. Streamlit redéploiera automatiquement l'application.
+- récupère aussi le `codeEpci` via geo.api.gouv.fr ;
+- réessaie automatiquement les erreurs temporaires 500/502/503/504 ;
+- si `/gpu/document?geom` échoue, teste directement :
+  - `DU_<codeEpci>` pour les PLUi ;
+  - `DU_<codeINSEE>` pour les PLU communaux ;
+- vérifie la partition en interrogeant directement `zone-urba` ;
+- filtre un PLUi sur le code INSEE de la commune pour éviter de charger toutes les communes de l'EPCI.
+
+Pour Capbreton, le fallback attendu est le PLUi MACS.
+
+## Déploiement
+
+Remplacer uniquement `app.py` sur GitHub.
+Le `requirements.txt` de la V3.3 peut être conservé.
