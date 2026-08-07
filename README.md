@@ -1,25 +1,21 @@
-# Prospecteur Foncier V3.4 — Gabarit PLU
+# Prospecteur Foncier V3.4.1 — correctif gabarit PLU
 
-Le logiciel extrait maintenant automatiquement dans le règlement écrit :
-- l'emprise au sol maximale ;
-- le nombre de niveaux (R+N / niveaux explicites) ;
-- à défaut, la hauteur maximale convertie en niveaux.
+La V3.4 était trop stricte : toute parcelle dont l'emprise ou le nombre de niveaux
+n'était pas extrait automatiquement disparaissait de l'affichage.
 
-Calcul :
-- Emprise constructible = Surface terrain × Emprise PLU
-- Surface brute = Emprise constructible × Nombre de niveaux
-- SDP = Surface brute × ratio SDP
-- SHAB = SDP × ratio SHAB
-- Logements = SHAB / SHAB moyenne par logement
+La V3.4.1 sépare désormais :
 
-Si l'emprise ou les niveaux ne sont pas trouvés, le logiciel n'invente pas de valeur :
-la parcelle n'entre pas dans le calcul automatique.
+- **Parcelles dans la cible logements** : gabarit PLU extrait + nombre de logements calculé ;
+- **Parcelles à vérifier** : parcelles conservées, mais dont l'emprise et/ou les niveaux
+  n'ont pas encore été lus automatiquement.
 
-Un audit affiche la règle trouvée, son niveau de confiance, l'extrait du règlement et le lien PDF.
+Autre correction importante : le logiciel exploite désormais le fragment `#page=N`
+que le standard CNIG peut placer dans `URLFIC` pour pointer directement vers la page
+du règlement correspondant à la zone.
 
-Limites restantes : retraits, bandes de constructibilité, pleine terre, stationnement,
-OAP, prescriptions graphiques et servitudes peuvent réduire la capacité réelle.
+Aucune valeur de capacité n'est inventée lorsque le règlement n'est pas interprétable.
 
-Déploiement GitHub :
-- remplacer `app.py`
-- remplacer `requirements.txt` (ajout de `pypdf`)
+## Déploiement
+
+Remplacer uniquement `app.py` sur GitHub.
+Le `requirements.txt` de la V3.4 ne change pas.

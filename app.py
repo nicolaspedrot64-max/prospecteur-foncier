@@ -8,7 +8,7 @@ import unicodedata
 import zipfile
 from datetime import date
 from pathlib import Path
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 import pandas as pd
 import pydeck as pdk
@@ -75,7 +75,7 @@ REGIONS = {
 }
 
 st.set_page_config(
-    page_title="Prospecteur Foncier V3.4",
+    page_title="Prospecteur Foncier V3.4.1",
     page_icon="🏗️",
     layout="wide",
 )
@@ -86,7 +86,7 @@ st.set_page_config(
 BDNB_API = "https://api.bdnb.io/v1/bdnb/donnees/batiment_groupe_complet"
 
 HEADERS = {
-    "User-Agent": "ProspecteurFoncier/3.4 (Streamlit; donnees publiques)",
+    "User-Agent": "ProspecteurFoncier/3.4.1 (Streamlit; donnees publiques)",
     "Accept": "application/json, application/geo+json, */*",
 }
 
@@ -709,20 +709,38 @@ def _norm_rule_text(value):
     return re.sub(r"\s+", " ", txt).strip()
 
 
+def _extract_page_hint(url):
+    """
+    Le standard CNIG permet à URLFIC de cibler une page du règlement
+    avec un fragment du type #page=24.
+    """
+    try:
+        parsed = urlparse(str(url or ""))
+        fragment = parsed.fragment or ""
+        m = re.search(r"(?:^|&)page=(\d+)", fragment, flags=re.I)
+        if m:
+            return int(m.group(1))
+    except Exception:
+        pass
+    return None
+
+
 def _resolve_pdf_bytes(url):
     if not url:
         raise RuntimeError("URL de règlement absente.")
+
+    page_hint = _extract_page_hint(url)
 
     r = requests.get(url, headers=HEADERS, timeout=120)
     r.raise_for_status()
     ctype = (r.headers.get("content-type") or "").lower()
 
     if r.content[:4] == b"%PDF" or "application/pdf" in ctype:
-        return r.content, r.url
+        return r.content, r.url, page_hint
 
     html = r.text
     links = re.findall(
-        r"href\s*=\s*[\"']([^\"']+\.pdf(?:\?[^\"']*)?)[\"']",
+        r"href\s*=\s*[\"']([^\"']+\.pdf(?:\?[^\"']*)?(?:#page=\d+)?)[\"']",
         html,
         flags=re.I,
     )
@@ -730,18 +748,21 @@ def _resolve_pdf_bytes(url):
         raise RuntimeError("URLFIC ne renvoie pas de PDF exploitable.")
 
     pdf_url = urljoin(r.url, links[0])
+    if page_hint is None:
+        page_hint = _extract_page_hint(pdf_url)
+
     r2 = requests.get(pdf_url, headers=HEADERS, timeout=120)
     r2.raise_for_status()
     if r2.content[:4] != b"%PDF" and "application/pdf" not in (
         r2.headers.get("content-type") or ""
     ).lower():
         raise RuntimeError("Le règlement trouvé n'est pas un PDF exploitable.")
-    return r2.content, r2.url
+    return r2.content, r2.url, page_hint
 
 
 @st.cache_data(ttl=24 * 3600, show_spinner=False)
 def fetch_plu_regulation_pages(url):
-    pdf_bytes, final_url = _resolve_pdf_bytes(url)
+    pdf_bytes, final_url, page_hint = _resolve_pdf_bytes(url)
     reader = PdfReader(io.BytesIO(pdf_bytes))
     pages = []
     for i, page in enumerate(reader.pages):
@@ -753,51 +774,70 @@ def fetch_plu_regulation_pages(url):
 
     if not any(p["norm"] for p in pages):
         raise RuntimeError("Le PDF ne contient pas de texte extractible automatiquement.")
-    return pages, final_url
+    return pages, final_url, page_hint
 
 
-def _zone_page_candidates(pages, zone_label, zone_long, commune_name):
+def _zone_page_candidates(pages, zone_label, zone_long, commune_name, page_hint=None):
     label = _norm_rule_text(zone_label)
     long_label = _norm_rule_text(zone_long)
     commune = _norm_rule_text(commune_name)
 
     hits = set()
+
+    # Priorité à l'index #page=N fourni par URLFIC.
+    if page_hint:
+        idx = max(0, int(page_hint) - 1)
+        for j in range(max(0, idx - 2), min(len(pages), idx + 8)):
+            hits.add(j)
+
+    # Recherche du titre de zone.
+    scored = []
     for i, p in enumerate(pages):
         txt = p["norm"]
         score = 0
 
         if long_label and len(long_label) >= 6 and long_label in txt:
-            score += 5
+            score += 6
 
         if label and len(label) >= 2:
             if re.search(rf"\bzone\s+{re.escape(label)}\b", txt):
-                score += 5
+                score += 6
             elif re.search(rf"\bsecteur\s+{re.escape(label)}\b", txt):
-                score += 4
+                score += 5
             elif re.search(rf"\b{re.escape(label)}\b", txt):
                 score += 2
 
         if commune and commune in txt:
             score += 1
 
-        if ("emprise au sol" in txt or "coefficient d'emprise" in txt) and (
-            "hauteur" in txt or "niveau" in txt
-        ):
-            score += 1
+        if score >= 4:
+            scored.append((score, i))
 
-        if score >= 3:
-            hits.add(i)
+    if scored:
+        best = max(s for s, _ in scored)
+        for score, i in scored:
+            if score >= best - 1:
+                for j in range(max(0, i - 2), min(len(pages), i + 7)):
+                    hits.add(j)
 
-    # Si URLFIC pointe déjà vers un petit règlement de zone, utiliser tout le document.
-    if not hits and len(pages) <= 40:
+    # Petit règlement dédié : on peut lire l'ensemble.
+    if not hits and len(pages) <= 60:
         hits = set(range(len(pages)))
 
-    expanded = set()
-    for i in hits:
-        for j in range(max(0, i - 2), min(len(pages), i + 4)):
-            expanded.add(j)
+    # Dernier recours : pages contenant les deux thèmes.
+    if not hits:
+        thematic = []
+        for i, p in enumerate(pages):
+            txt = p["norm"]
+            if ("emprise au sol" in txt or "coefficient d'emprise" in txt) and (
+                "hauteur" in txt or "niveau" in txt
+            ):
+                thematic.append(i)
+        for i in thematic[:20]:
+            for j in range(max(0, i - 1), min(len(pages), i + 3)):
+                hits.add(j)
 
-    return [pages[i] for i in sorted(expanded)]
+    return [pages[i] for i in sorted(hits)]
 
 
 def _candidate_windows(text, keyword_regex, before=220, after=520):
@@ -947,8 +987,14 @@ def extract_plu_zone_rule(reglement_url, zone_label, zone_long, commune_name, fl
         }
 
     try:
-        pages, final_url = fetch_plu_regulation_pages(reglement_url)
-        candidates = _zone_page_candidates(pages, zone_label, zone_long, commune_name)
+        pages, final_url, page_hint = fetch_plu_regulation_pages(reglement_url)
+        candidates = _zone_page_candidates(
+            pages,
+            zone_label,
+            zone_long,
+            commune_name,
+            page_hint=page_hint,
+        )
         if not candidates:
             return {
                 "emprise_plu_pct": None, "niveaux_plu": None, "hauteur_plu_m": None,
@@ -1014,6 +1060,7 @@ def enrich_with_plu_capacity_rules(
         "regle_plu_methode": "",
         "regle_plu_extrait": "",
         "reglement_final_url": "",
+        "statut_gabarit_plu": "",
     }.items():
         if col not in df.columns:
             df[col] = default
@@ -1075,6 +1122,14 @@ def enrich_with_plu_capacity_rules(
         df.at[idx, "sdp_estimee_m2"] = round(sdp)
         df.at[idx, "shab_estimee_m2"] = round(shab)
         df.at[idx, "logements_estimes"] = int(max(0, logements))
+
+    df["statut_gabarit_plu"] = "À vérifier — règle PLU non extraite"
+    ok_mask = (
+        pd.to_numeric(df["emprise_plu_pct"], errors="coerce").notna()
+        & pd.to_numeric(df["niveaux_plu"], errors="coerce").notna()
+        & pd.to_numeric(df["logements_estimes"], errors="coerce").notna()
+    )
+    df.loc[ok_mask, "statut_gabarit_plu"] = "Calculé automatiquement"
 
     return df, rule_df
 
@@ -1749,6 +1804,7 @@ def analyse_commune(
         "regle_plu_confiance",
         "regle_plu_methode",
         "regle_plu_extrait",
+        "statut_gabarit_plu",
         "date_zone",
         "logements_estimes",
         "score",
@@ -1851,7 +1907,7 @@ def generate_letter(row, signataire, fonction, email, ville_signature):
 # --------------------------
 # Interface
 # --------------------------
-st.title("🏗️ Prospecteur Foncier — V3.4 — Gabarit PLU")
+st.title("🏗️ Prospecteur Foncier — V3.4.1 — Gabarit PLU")
 st.caption(
     "Cadastre réel + PLU/PLUi + extraction emprise/niveaux + propriétaires personnes morales + calcul de capacité."
 )
@@ -2154,35 +2210,44 @@ if results is not None and st.session_state.get("analysis_insee") == insee:
         & (results["logements_estimes"] <= max_log)
     ].copy()
 
-    # Sécurité supplémentaire : les secteurs à vocation économique sont toujours exclus.
-    if "economic_vocation" in filtered.columns:
-        filtered = filtered[filtered["economic_vocation"] == False].copy()
+    unresolved = results[~calculable_mask].copy()
 
-    # Règle métier : on élimine les parcelles sur lesquelles
-    # la BDNB identifie déjà du logement collectif.
-    filtered = filtered[filtered["collectif_existant"] == False].copy()
+    # Appliquer les mêmes exclusions métier aux deux listes.
+    cleaned = []
+    for frame in [filtered, unresolved]:
+        if "economic_vocation" in frame.columns:
+            frame = frame[frame["economic_vocation"] == False].copy()
+        if "collectif_existant" in frame.columns:
+            frame = frame[frame["collectif_existant"] == False].copy()
 
-    if terrain_mode == "Terrain nu":
-        filtered = filtered[filtered["terrain_bati"] == False]
-    elif terrain_mode == "Terrain bâti":
-        filtered = filtered[filtered["terrain_bati"] == True]
+        if terrain_mode == "Terrain nu":
+            frame = frame[frame["terrain_bati"] == False]
+        elif terrain_mode == "Terrain bâti":
+            frame = frame[frame["terrain_bati"] == True]
 
-    filtered = filtered.sort_values(
-        ["score", "surface_m2"],
-        ascending=[False, False],
-    ).reset_index(drop=True)
+        frame = frame.sort_values(
+            ["score", "surface_m2"],
+            ascending=[False, False],
+        ).reset_index(drop=True)
+        cleaned.append(frame)
+
+    filtered, unresolved = cleaned
 
     st.subheader("2. Résultats sur le cadastre réel")
 
-    if filtered.empty:
+    if filtered.empty and not unresolved.empty:
         st.warning(
-            "Le cadastre et le PLU ont bien été analysés, mais aucune parcelle ne correspond "
-            "à l'ensemble des critères actuels (habitat, nombre de logements, type de terrain, collectif existant, etc.)."
+            "Des parcelles candidates ont bien été trouvées, mais leur gabarit PLU n'a pas encore pu "
+            "être extrait automatiquement. Elles sont conservées dans « Parcelles à vérifier » ci-dessous."
+        )
+    elif filtered.empty and unresolved.empty:
+        st.warning(
+            "Aucune parcelle ne correspond aux critères actuels après les exclusions métier."
         )
     m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Parcelles retenues", len(filtered))
-    m2.metric("Parcelles avec gabarit PLU", int(calculable_mask.sum()))
-    m3.metric("Parcelles avant filtre logements", len(results))
+    m1.metric("Parcelles dans la cible logements", len(filtered))
+    m2.metric("Gabarit PLU à vérifier", len(unresolved))
+    m3.metric("Parcelles candidates analysées", len(results))
     m4.metric("Document urbanisme", st.session_state.get("analysis_partition", "—"))
 
     if st.session_state.get("analysis_partition", "").startswith("DU_") and code_epci:
@@ -2228,21 +2293,22 @@ if results is not None and st.session_state.get("analysis_insee") == insee:
                 hide_index=True,
             )
 
-    if filtered.empty:
+    map_source = filtered if not filtered.empty else unresolved
+
+    if map_source.empty:
         st.warning("Aucune parcelle ne correspond aux critères actuels.")
     else:
-        # Carte réelle des parcelles.
         fmap = st.session_state.get("feature_map", {})
         map_features = []
-        for ref in filtered["reference"].head(2000):
+        for ref in map_source["reference"].head(2000):
             feat = fmap.get(ref)
             if feat:
                 map_features.append(feat)
 
         if map_features:
             fc = {"type": "FeatureCollection", "features": map_features}
-            center_lat = float(filtered["latitude"].mean())
-            center_lon = float(filtered["longitude"].mean())
+            center_lat = float(map_source["latitude"].mean())
+            center_lon = float(map_source["longitude"].mean())
 
             layer = pdk.Layer(
                 "GeoJsonLayer",
@@ -2284,11 +2350,44 @@ if results is not None and st.session_state.get("analysis_insee") == insee:
             st.pydeck_chart(deck, use_container_width=True)
 
         st.caption(
-            "La carte affiche les vraies géométries cadastrales. Pour les communes très importantes, "
-            "l'affichage cartographique est limité aux 2 000 premiers résultats afin de garder l'application fluide."
+            "La carte affiche les vraies géométries cadastrales. Si aucun gabarit n'a pu être calculé, "
+            "elle affiche les parcelles dont le règlement PLU doit encore être vérifié."
         )
 
+        if not unresolved.empty:
+            with st.expander(
+                f"Parcelles à vérifier — gabarit PLU non extrait ({len(unresolved)})",
+                expanded=filtered.empty,
+            ):
+                cols = [
+                    "reference",
+                    "section",
+                    "numero",
+                    "surface_m2",
+                    "zone_type",
+                    "zone_plu",
+                    "regle_plu_methode",
+                    "regle_plu_confiance",
+                    "reglement_url",
+                    "proprietaire_personne_morale",
+                ]
+                st.dataframe(
+                    unresolved[[c for c in cols if c in unresolved.columns]],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+                st.caption(
+                    "Ces parcelles ne sont pas rejetées : seule leur capacité reste à confirmer."
+                )
+
         st.subheader("3. Sélection des parcelles")
+        if filtered.empty:
+            st.info(
+                "Aucune parcelle n'est encore sélectionnable automatiquement selon le nombre de logements, "
+                "car le gabarit PLU n'a pas pu être extrait. Consulte la liste « Parcelles à vérifier »."
+            )
+            st.stop()
+
         table = filtered[
             [
                 "selection",
@@ -2313,6 +2412,7 @@ if results is not None and st.session_state.get("analysis_insee") == insee:
                 "nb_batiments",
                 "zone_type",
                 "zone_plu",
+                "statut_gabarit_plu",
                 "habitat_statut",
                 "habitat_preuve",
                 "habitat_confiance",
@@ -2358,6 +2458,7 @@ if results is not None and st.session_state.get("analysis_insee") == insee:
                 "nb_batiments": st.column_config.NumberColumn("Nb bâtiments"),
                 "zone_type": st.column_config.TextColumn("Type zone"),
                 "zone_plu": st.column_config.TextColumn("Zone PLU"),
+                "statut_gabarit_plu": st.column_config.TextColumn("Statut gabarit PLU"),
                 "habitat_statut": st.column_config.TextColumn("Statut habitat"),
                 "habitat_preuve": st.column_config.TextColumn("Preuve habitat"),
                 "habitat_confiance": st.column_config.ProgressColumn(
@@ -2400,6 +2501,7 @@ if results is not None and st.session_state.get("analysis_insee") == insee:
                 "nb_batiments",
                 "zone_type",
                 "zone_plu",
+                "statut_gabarit_plu",
                 "habitat_statut",
                 "habitat_preuve",
                 "habitat_confiance",
