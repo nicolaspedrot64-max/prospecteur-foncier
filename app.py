@@ -8,6 +8,7 @@ import unicodedata
 import zipfile
 from datetime import date
 from pathlib import Path
+from urllib.parse import urlparse
 
 import pandas as pd
 import pydeck as pdk
@@ -18,6 +19,7 @@ except ImportError:
     duckdb = None
 import streamlit as st
 from docx import Document
+from pypdf import PdfReader
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_CENTER, TA_LEFT
 from reportlab.lib.pagesizes import A4
@@ -35,6 +37,7 @@ from reportlab.platypus import (
 )
 from pyproj import Geod
 from shapely.geometry import shape, mapping
+from shapely.ops import unary_union
 from shapely.strtree import STRtree
 
 APP_DIR = Path(__file__).parent
@@ -101,7 +104,7 @@ REGIONS = {
 }
 
 st.set_page_config(
-    page_title="Prospecteur Foncier V3.7.4",
+    page_title="Prospecteur Foncier V3.8",
     page_icon="🏗️",
     layout="wide",
 )
@@ -112,7 +115,7 @@ st.set_page_config(
 BDNB_API = "https://api.bdnb.io/v1/bdnb/donnees/batiment_groupe_complet"
 
 HEADERS = {
-    "User-Agent": "ProspecteurFoncier/3.7.4 (Streamlit; donnees publiques)",
+    "User-Agent": "ProspecteurFoncier/3.8 (Streamlit; donnees publiques)",
     "Accept": "application/json, application/geo+json, */*",
 }
 
@@ -1732,6 +1735,849 @@ def parcel_properties(feature):
     }
 
 
+INDUSTRIAL_STRICT_KEYWORDS = [
+    "industrie",
+    "industriel",
+    "industrielle",
+    "industriels",
+    "industrielles",
+    "zone industrielle",
+    "secteur industriel",
+    "activite industrielle",
+    "activites industrielles",
+    "logistique",
+    "plateforme logistique",
+    "entrepot",
+    "entrepots",
+    "artisanale",
+    "zone artisanale",
+    "parc d activites",
+    "zone d activites",
+    "zone d activite",
+    "vocation economique",
+    "activites economiques",
+]
+
+
+def classify_zone_for_search(props, include_au=True):
+    """
+    Filtre métier V3.8 :
+    - exclut A, N, AUs et assimilées ;
+    - exclut les zones d'activités économiques/industrielles ;
+    - conserve U et, si demandé, AUc/AU ouverts à l'urbanisation.
+
+    Le filtre ne cherche PAS à imposer une destination habitat : l'utilisateur a
+    demandé de supprimer ce filtre. Il élimine uniquement les zones manifestement
+    non constructibles ou économiques/industrielles.
+    """
+    typezone = _normalise_typezone(props.get("typezone"))
+    tu = normalize_text(typezone).replace(" ", "")
+    libelle = str(props.get("libelle") or "")
+    libelong = str(props.get("libelong") or "")
+    text = normalize_text(f"{libelle} {libelong}")
+
+    economic, economic_reason = detect_economic_vocation(props)
+
+    # Anciennes variantes Ah/Nh/Nd : elles restent des zones A/N.
+    if tu.startswith("a") and tu not in {"au", "auc", "aus"}:
+        return False, "Zone agricole / non constructible", typezone
+    if tu.startswith("n"):
+        return False, "Zone naturelle / non constructible", typezone
+    if typezone == "AUs":
+        return False, "Zone AU bloquée (AUs)", typezone
+
+    if typezone in {"AUc", "AU"} and not include_au:
+        return False, "Zone AU désactivée dans les critères", typezone
+
+    if typezone not in {"U", "AUc", "AU"}:
+        return False, f"Type de zone non retenu : {typezone or 'inconnu'}", typezone
+
+    if economic:
+        return False, economic_reason, typezone
+
+    if any(k in text for k in INDUSTRIAL_STRICT_KEYWORDS):
+        return False, f"Zone industrielle/économique : {libelle or libelong}", typezone
+
+    # Certains PLU anciens ne renseignent ni FORMDOMI ni un LIBELONG explicite,
+    # mais utilisent des codes locaux très classiques pour les zones d'activités.
+    # On applique cette heuristique seulement aux codes les plus caractéristiques.
+    zone_code = re.sub(r"[^A-Z0-9]", "", str(libelle or "").upper())
+    if re.match(r"^(?:U(?:X|Y|I)[A-Z0-9]*|(?:1|2)?AU(?:X|Y|I)[A-Z0-9]*)$", zone_code):
+        return False, f"Code de zone d'activités/industrie : {libelle}", typezone
+
+    return True, "Zone constructible retenue", typezone
+
+
+def _rule_text_norm(value):
+    txt = str(value or "").replace("\xa0", " ")
+    txt = unicodedata.normalize("NFKD", txt)
+    txt = "".join(c for c in txt if not unicodedata.combining(c))
+    txt = txt.lower().replace("’", "'").replace("–", "-").replace("—", "-")
+    return re.sub(r"\s+", " ", txt).strip()
+
+
+def _url_page_hint(url):
+    try:
+        fragment = urlparse(str(url or "")).fragment or ""
+        m = re.search(r"(?:^|&)page=(\d+)", fragment, flags=re.I)
+        return int(m.group(1)) if m else None
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
+def fetch_rule_pdf_pages(url):
+    """
+    Télécharge uniquement le règlement lié à une zone/prescription.
+    Pas d'archive PLUi complète : cette approche reste compatible avec Streamlit.
+    """
+    if not url:
+        return [], None
+
+    r = requests.get(url, headers=HEADERS, timeout=75)
+    r.raise_for_status()
+
+    if r.content[:4] != b"%PDF" and "application/pdf" not in (
+        r.headers.get("content-type") or ""
+    ).lower():
+        raise RuntimeError("Le lien URLFIC ne renvoie pas directement un PDF.")
+
+    reader = PdfReader(io.BytesIO(r.content))
+    pages = []
+    for i, page in enumerate(reader.pages):
+        try:
+            txt = page.extract_text() or ""
+        except Exception:
+            txt = ""
+        pages.append(
+            {
+                "page": i + 1,
+                "text": txt,
+                "norm": _rule_text_norm(txt),
+            }
+        )
+
+    return pages, _url_page_hint(url)
+
+
+def _zone_rule_pages(pages, zone_label, page_hint=None):
+    """
+    Sélectionne uniquement les pages susceptibles de concerner la zone.
+    URLFIC#page=N est prioritaire. Sinon on repère les titres de zone.
+    """
+    if not pages:
+        return []
+
+    indexes = set()
+
+    if page_hint:
+        idx = max(0, int(page_hint) - 1)
+        for j in range(max(0, idx - 2), min(len(pages), idx + 14)):
+            indexes.add(j)
+
+    z = _rule_text_norm(zone_label)
+    if z:
+        scored = []
+        for i, p in enumerate(pages):
+            txt = p["norm"]
+            score = 0
+            if re.search(rf"\bzone\s+{re.escape(z)}\b", txt):
+                score += 8
+            elif re.search(rf"\bsecteur\s+{re.escape(z)}\b", txt):
+                score += 7
+            elif len(z) >= 2 and re.search(rf"\b{re.escape(z)}\b", txt):
+                score += 2
+
+            if "emprise au sol" in txt:
+                score += 2
+            if "hauteur" in txt or re.search(r"\br\s*\+\s*\d+", txt):
+                score += 2
+
+            if score >= 5:
+                scored.append((score, i))
+
+        if scored:
+            best = max(s for s, _ in scored)
+            for score, i in scored:
+                if score >= best - 1:
+                    for j in range(max(0, i - 2), min(len(pages), i + 12)):
+                        indexes.add(j)
+
+    # Si le document est court, il s'agit souvent du règlement de zone lui-même.
+    if not indexes and len(pages) <= 45:
+        indexes.update(range(len(pages)))
+
+    return [pages[i] for i in sorted(indexes)]
+
+
+def _rule_context_score(text):
+    t = _rule_text_norm(text)
+    score = 0
+
+    for x in [
+        "maximum",
+        "maximale",
+        "ne peut exceder",
+        "ne doit pas exceder",
+        "au maximum",
+        "est limitee a",
+        "est limite a",
+        "fixee a",
+        "fixe a",
+    ]:
+        if x in t:
+            score += 2
+
+    # Éviter de prendre les règles d'annexes, clôtures, piscines, etc.
+    for x in [
+        "annexe",
+        "abri",
+        "piscine",
+        "cloture",
+        "local technique",
+        "equipement public",
+    ]:
+        if x in t:
+            score -= 2
+
+    return score
+
+
+def extract_emprise_from_rule_text(text):
+    t = _rule_text_norm(text)
+    candidates = []
+
+    for m in re.finditer(
+        r"(?:emprise\s+au\s+sol|coefficient\s+d[' ]?emprise|\bces\b)",
+        t,
+    ):
+        w = t[max(0, m.start() - 260): min(len(t), m.end() + 720)]
+
+        if "non reglement" in w or "sans objet" in w:
+            continue
+
+        for p in re.finditer(r"(?<!\d)(\d{1,3}(?:[.,]\d+)?)\s*%", w):
+            val = float(p.group(1).replace(",", "."))
+            if 0 < val <= 100:
+                around = w[max(0, p.start() - 180): p.end() + 180]
+                score = _rule_context_score(around)
+                if "emprise" in around or "ces" in around:
+                    score += 6
+                candidates.append((score, val, around))
+
+        for p in re.finditer(
+            r"(?:ces|coefficient\s+d[' ]?emprise).{0,120}?"
+            r"(?:=|:|fixe(?:e)?\s+a)?\s*(0[.,]\d+)",
+            w,
+        ):
+            val = float(p.group(1).replace(",", ".")) * 100
+            if 0 < val <= 100:
+                around = w[max(0, p.start() - 170): p.end() + 190]
+                candidates.append((_rule_context_score(around) + 7, val, around))
+
+    if not candidates:
+        return None, 0, ""
+
+    candidates.sort(key=lambda x: (-x[0], x[1]))
+    score, value, excerpt = candidates[0]
+    confidence = 93 if score >= 10 else 84 if score >= 7 else 68
+    return round(value, 2), confidence, excerpt[:750]
+
+
+def extract_height_from_rule_text(text, floor_height_m):
+    t = _rule_text_norm(text)
+    direct = []
+    heights = []
+
+    for m in re.finditer(r"(?:hauteur|niveaux?|r\s*\+\s*\d+)", t):
+        w = t[max(0, m.start() - 280): min(len(t), m.end() + 850)]
+
+        # Priorité à R+N ou à un nombre de niveaux explicite.
+        for p in re.finditer(r"\br\s*\+\s*(\d{1,2})\b", w):
+            n = int(p.group(1)) + 1
+            if 1 <= n <= 20:
+                around = w[max(0, p.start() - 180): p.end() + 220]
+                direct.append(
+                    (_rule_context_score(around) + 9, n, None, "R+N explicite", around)
+                )
+
+        for pat in [
+            r"(?<!\d)(\d{1,2})\s+niveaux?\s*(?:maximum|maxi)?",
+            r"(?:maximum|maximale?)\s+(?:de\s+)?(\d{1,2})\s+niveaux?",
+        ]:
+            for p in re.finditer(pat, w):
+                n = int(p.group(1))
+                if 1 <= n <= 20:
+                    around = w[max(0, p.start() - 180): p.end() + 220]
+                    direct.append(
+                        (_rule_context_score(around) + 7, n, None, "niveaux explicites", around)
+                    )
+
+        # Hauteur en mètres.
+        for p in re.finditer(
+            r"(?:hauteur.{0,180}?)(\d{1,2}(?:[.,]\d+)?)\s*m(?:etre)?s?\b",
+            w,
+        ):
+            h = float(p.group(1).replace(",", "."))
+            if 2.5 <= h <= 60:
+                around = w[max(0, p.start() - 180): p.end() + 220]
+                score = _rule_context_score(around) + 3
+                if any(x in around for x in ["egout", "acrot", "facade"]):
+                    score += 4
+                if "faitage" in around and not any(
+                    x in around for x in ["egout", "acrot"]
+                ):
+                    score -= 2
+                heights.append((score, h, around))
+
+    if direct:
+        direct.sort(key=lambda x: (-x[0], -x[1]))
+        score, levels, _, method, excerpt = direct[0]
+        conf = 96 if score >= 12 else 87 if score >= 8 else 74
+        return levels, None, conf, method, excerpt[:750]
+
+    if heights:
+        heights.sort(key=lambda x: (-x[0], x[1]))
+        score, h, excerpt = heights[0]
+        levels = max(
+            1,
+            int(math.floor(float(h) / max(float(floor_height_m), 0.1))),
+        )
+        conf = 78 if score >= 10 else 67 if score >= 7 else 54
+        return levels, round(h, 2), conf, "hauteur convertie en niveaux", excerpt[:750]
+
+    return None, None, 0, "", ""
+
+
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
+def extract_zone_base_rule(reglement_url, zone_label, floor_height_m):
+    """
+    Valeur de base attachée à la zone graphique.
+    Les prescriptions 38/39 locales restent prioritaires ensuite.
+    """
+    empty = {
+        "emprise_pct": None,
+        "levels": None,
+        "height_m": None,
+        "emprise_conf": 0,
+        "height_conf": 0,
+        "emprise_source": "",
+        "height_source": "",
+        "emprise_excerpt": "",
+        "height_excerpt": "",
+    }
+
+    if not reglement_url:
+        return empty
+
+    try:
+        pages, page_hint = fetch_rule_pdf_pages(reglement_url)
+        subset = _zone_rule_pages(
+            pages,
+            zone_label=zone_label,
+            page_hint=page_hint,
+        )
+        if not subset:
+            return empty
+
+        text = "\n".join(p["text"] for p in subset)
+
+        emprise, ec, ee = extract_emprise_from_rule_text(text)
+        levels, height, hc, hm, he = extract_height_from_rule_text(
+            text,
+            floor_height_m=floor_height_m,
+        )
+
+        return {
+            "emprise_pct": emprise,
+            "levels": levels,
+            "height_m": height,
+            "emprise_conf": ec,
+            "height_conf": hc,
+            "emprise_source": "Règlement lié à la zone graphique" if emprise is not None else "",
+            "height_source": (
+                f"Règlement lié à la zone graphique — {hm}"
+                if levels is not None
+                else ""
+            ),
+            "emprise_excerpt": ee,
+            "height_excerpt": he,
+        }
+    except Exception:
+        return empty
+
+
+def build_commune_zone_rule_catalog(zones_geojson, include_au, floor_height_m):
+    """
+    Pré-interprétation SPÉCIFIQUE à la commune sélectionnée.
+    Une règle n'est lue qu'une fois par zone/règlement.
+    """
+    catalog = {}
+    for zf in zones_geojson.get("features", []) or []:
+        props = zf.get("properties", {}) or {}
+        allowed, reason, typezone = classify_zone_for_search(
+            props,
+            include_au=include_au,
+        )
+        if not allowed:
+            continue
+
+        label = str(props.get("libelle") or "")
+        url = str(props.get("urlfic") or "")
+        key = (label, url)
+        if key in catalog:
+            continue
+
+        catalog[key] = extract_zone_base_rule(
+            url,
+            label,
+            float(floor_height_m),
+        )
+
+    return catalog
+
+
+def _overlay_piece_value(pieces, rule_geom, field, value, source, confidence):
+    """
+    Découpe une sous-surface de parcelle. La prescription graphique ne s'applique
+    qu'à son périmètre réel, jamais à toute la parcelle par approximation.
+    """
+    out = []
+    for piece in pieces:
+        geom = piece["geom"]
+        try:
+            inter = geom.intersection(rule_geom)
+            diff = geom.difference(rule_geom)
+        except Exception:
+            out.append(piece)
+            continue
+
+        if not inter.is_empty and geodesic_area_m2(inter) > 0.05:
+            p = dict(piece)
+            p["geom"] = inter
+            p[field] = value
+            p[field + "_source"] = source
+            p[field + "_conf"] = confidence
+            out.append(p)
+
+        if not diff.is_empty and geodesic_area_m2(diff) > 0.05:
+            p = dict(piece)
+            p["geom"] = diff
+            out.append(p)
+
+    return out
+
+
+def build_nonbuildable_graphic_index(graphic_prescriptions):
+    """
+    CNIG 02-01 = secteur avec interdiction de constructibilité.
+    Ces surfaces sont retranchées de la partie constructible de la parcelle.
+    """
+    rules = []
+    for feat in (
+        (graphic_prescriptions or {})
+        .get("prescription-surf", {})
+        .get("features", [])
+        or []
+    ):
+        props = feat.get("properties", {}) or {}
+        t = _clean_psc_code(props.get("typepsc"))
+        st = _clean_psc_code(props.get("stypepsc"))
+        if t != "02" or st != "01":
+            continue
+
+        geom = valid_shape(feat)
+        if geom is None:
+            continue
+
+        rules.append(
+            {
+                "geom": geom,
+                "libelle": str(props.get("libelle") or ""),
+                "txt": str(props.get("txt") or ""),
+                "urlfic": str(props.get("urlfic") or ""),
+            }
+        )
+
+    geoms = [r["geom"] for r in rules]
+    return {
+        "rules": rules,
+        "tree": STRtree(geoms) if geoms else None,
+    }
+
+
+def subtract_nonbuildable_graphics(geom, nonbuildable_index):
+    """
+    Soustrait les secteurs graphiques explicitement inconstructibles (02-01).
+    """
+    if geom is None or geom.is_empty:
+        return geom, 0.0, []
+
+    tree = (nonbuildable_index or {}).get("tree")
+    rules = (nonbuildable_index or {}).get("rules", [])
+    if tree is None:
+        return geom, 0.0, []
+
+    cuts = []
+    labels = []
+
+    for ridx in tree.query(geom, predicate="intersects"):
+        rule = rules[int(ridx)]
+        try:
+            inter = geom.intersection(rule["geom"])
+        except Exception:
+            continue
+        if inter.is_empty:
+            continue
+        if geodesic_area_m2(inter) <= 0.05:
+            continue
+        cuts.append(inter)
+        labels.append(rule.get("libelle") or rule.get("txt") or "CNIG 02-01")
+
+    if not cuts:
+        return geom, 0.0, []
+
+    cut_union = unary_union(cuts)
+    try:
+        remaining = geom.difference(cut_union)
+    except Exception:
+        return geom, 0.0, []
+
+    removed = geodesic_area_m2(geom.intersection(cut_union))
+    return remaining, removed, list(dict.fromkeys(labels))
+
+
+def enrich_with_precise_commune_rules(
+    df,
+    feature_map,
+    rule_indexes,
+    zone_rule_catalog,
+    ratio_sdp_pct,
+    ratio_shab_pct,
+    shab_par_logement,
+    floor_height_m,
+):
+    """
+    Calcul V3.8 :
+    1. la parcelle est déjà découpée sur les ZONE_URBA officielles ;
+    2. chaque morceau reçoit la règle de base de sa zone ;
+    3. les prescriptions graphiques 38-02 / 39-02 remplacent localement la règle ;
+    4. surface brute = somme des sous-surfaces × emprise × niveaux.
+
+    Aucune zone A/N/AUs/économique/industrielle ne participe au calcul.
+    """
+    df = df.copy()
+
+    defaults = {
+        "emprise_plu_pct": None,
+        "hauteur_plu_m": None,
+        "niveaux_plu": None,
+        "surface_brute_plu_m2": None,
+        "sdp_plu_m2": None,
+        "shab_plu_m2": None,
+        "logements_plu": None,
+        "gabarit_plu_statut": "À vérifier",
+        "gabarit_plu_source": "",
+        "gabarit_plu_confiance": 0,
+        "gabarit_couverture_pct": 0.0,
+        "prescription_emprise": "",
+        "prescription_hauteur": "",
+        "regle_emprise_source": "",
+        "regle_hauteur_source": "",
+        "regle_emprise_extrait": "",
+        "regle_hauteur_extrait": "",
+    }
+    for c, default in defaults.items():
+        if c not in df.columns:
+            df[c] = default
+
+    if df.empty:
+        return df
+
+    surf_tree = rule_indexes.get("surf_tree")
+    surf_rules = rule_indexes.get("surf_rules", [])
+
+    for idx, row in df.iterrows():
+        feat = feature_map.get(row["reference"])
+        if not feat:
+            continue
+
+        zone_pieces = feat.get("_zone_pieces", []) or []
+        if not zone_pieces:
+            continue
+
+        all_pieces = []
+        applied_e = []
+        applied_h = []
+
+        for zp in zone_pieces:
+            zg = shape(zp["geometry"])
+            key = (str(zp.get("zone_plu") or ""), str(zp.get("reglement_url") or ""))
+            base = zone_rule_catalog.get(key, {})
+
+            base_e = base.get("emprise_pct")
+            base_l = base.get("levels")
+
+            pieces = [
+                {
+                    "geom": zg,
+                    "emprise": base_e,
+                    "levels": base_l,
+                    "emprise_source": base.get("emprise_source", ""),
+                    "levels_source": base.get("height_source", ""),
+                    "emprise_conf": base.get("emprise_conf", 0),
+                    "levels_conf": base.get("height_conf", 0),
+                    "height_m": base.get("height_m"),
+                    "emprise_excerpt": base.get("emprise_excerpt", ""),
+                    "height_excerpt": base.get("height_excerpt", ""),
+                }
+            ]
+
+            # Prescriptions surfaciques 38/39 : source graphique la plus précise.
+            if surf_tree is not None:
+                hits = []
+                for ridx in surf_tree.query(zg, predicate="intersects"):
+                    rule = surf_rules[int(ridx)]
+                    try:
+                        inter = zg.intersection(rule["geom"])
+                        area = geodesic_area_m2(inter)
+                    except Exception:
+                        area = 0.0
+                    if area > 0.05:
+                        hits.append((area, rule))
+
+                # Les plus grandes prescriptions sont appliquées d'abord ;
+                # les plus petites/locales appliquées ensuite les remplacent localement.
+                hits.sort(key=lambda x: -x[0])
+
+                for _, rule in hits:
+                    if (
+                        rule.get("typepsc") == "38"
+                        and rule.get("emprise_pct") is not None
+                    ):
+                        pieces = _overlay_piece_value(
+                            pieces,
+                            rule["geom"],
+                            "emprise",
+                            float(rule["emprise_pct"]),
+                            f"Prescription graphique {rule.get('typepsc')}-{rule.get('stypepsc')}",
+                            int(rule.get("confidence", 0)),
+                        )
+                        applied_e.append(rule)
+
+                    if rule.get("typepsc") == "39":
+                        levels = rule.get("levels")
+                        height = rule.get("height_m")
+                        if levels is None and height is not None:
+                            levels = max(
+                                1,
+                                int(
+                                    math.floor(
+                                        float(height)
+                                        / max(float(floor_height_m), 0.1)
+                                    )
+                                ),
+                            )
+                        if levels is not None:
+                            pieces = _overlay_piece_value(
+                                pieces,
+                                rule["geom"],
+                                "levels",
+                                int(levels),
+                                f"Prescription graphique {rule.get('typepsc')}-{rule.get('stypepsc')}",
+                                int(rule.get("confidence", 0)),
+                            )
+                            applied_h.append(rule)
+
+            all_pieces.extend(pieces)
+
+        eligible_area = max(
+            float(row.get("surface_plu_eligible_m2") or 0),
+            0.01,
+        )
+        covered_area = 0.0
+        gross = 0.0
+        weighted_e = 0.0
+        weighted_levels = 0.0
+        weighted_height = 0.0
+        height_area = 0.0
+        confs = []
+        emprise_sources = []
+        height_sources = []
+        emprise_excerpts = []
+        height_excerpts = []
+
+        for piece in all_pieces:
+            area = geodesic_area_m2(piece["geom"])
+            e = piece.get("emprise")
+            levels = piece.get("levels")
+
+            if e is not None:
+                weighted_e += area * float(e)
+            if levels is not None:
+                weighted_levels += area * float(levels)
+            if piece.get("height_m") is not None:
+                weighted_height += area * float(piece["height_m"])
+                height_area += area
+
+            if piece.get("emprise_source"):
+                emprise_sources.append(piece["emprise_source"])
+            if piece.get("levels_source"):
+                height_sources.append(piece["levels_source"])
+            if piece.get("emprise_excerpt"):
+                emprise_excerpts.append(piece["emprise_excerpt"])
+            if piece.get("height_excerpt"):
+                height_excerpts.append(piece["height_excerpt"])
+
+            if e is not None and levels is not None:
+                covered_area += area
+                gross += area * (float(e) / 100.0) * float(levels)
+                if piece.get("emprise_conf"):
+                    confs.append(int(piece["emprise_conf"]))
+                if piece.get("levels_conf"):
+                    confs.append(int(piece["levels_conf"]))
+
+        coverage = max(0.0, min(100.0, 100.0 * covered_area / eligible_area))
+        df.at[idx, "gabarit_couverture_pct"] = round(coverage, 1)
+
+        if weighted_e > 0:
+            df.at[idx, "emprise_plu_pct"] = round(weighted_e / eligible_area, 2)
+        if weighted_levels > 0:
+            df.at[idx, "niveaux_plu"] = round(weighted_levels / eligible_area, 2)
+        if height_area > 0:
+            df.at[idx, "hauteur_plu_m"] = round(weighted_height / height_area, 2)
+
+        # La capacité n'est validée automatiquement que si presque toute la partie
+        # constructible de la parcelle dispose d'une emprise ET d'une hauteur.
+        if coverage >= 95.0 and gross > 0:
+            sdp = gross * float(ratio_sdp_pct) / 100.0
+            shab = sdp * float(ratio_shab_pct) / 100.0
+            logements = math.floor(
+                shab / max(float(shab_par_logement), 1.0)
+            )
+
+            df.at[idx, "surface_brute_plu_m2"] = round(gross)
+            df.at[idx, "sdp_plu_m2"] = round(sdp)
+            df.at[idx, "shab_plu_m2"] = round(shab)
+            df.at[idx, "logements_plu"] = int(max(0, logements))
+            df.at[idx, "gabarit_plu_statut"] = "Calculé sur cadastre + PLU/PLUi en vigueur"
+            df.at[idx, "gabarit_plu_source"] = (
+                "Zonage graphique + prescriptions 38/39 + règlement de zone"
+            )
+            df.at[idx, "gabarit_plu_confiance"] = (
+                min(confs) if confs else 60
+            )
+        else:
+            missing = []
+            if df.at[idx, "emprise_plu_pct"] in [None, ""]:
+                missing.append("emprise non chiffrée")
+            if df.at[idx, "niveaux_plu"] in [None, ""]:
+                missing.append("hauteur/niveaux non chiffrés")
+            if coverage < 95:
+                missing.append(f"couverture règles {coverage:.0f}%")
+            df.at[idx, "gabarit_plu_statut"] = "À vérifier — " + ", ".join(missing)
+            df.at[idx, "gabarit_plu_source"] = "PLU/PLUi spécifique commune — données incomplètes"
+
+        if applied_e:
+            df.at[idx, "prescription_emprise"] = " / ".join(
+                dict.fromkeys(
+                    f"{r.get('typepsc')}-{r.get('stypepsc')} "
+                    f"{r.get('libelle') or r.get('txt') or ''}".strip()
+                    for r in applied_e
+                )
+            )[:800]
+        if applied_h:
+            df.at[idx, "prescription_hauteur"] = " / ".join(
+                dict.fromkeys(
+                    f"{r.get('typepsc')}-{r.get('stypepsc')} "
+                    f"{r.get('libelle') or r.get('txt') or ''}".strip()
+                    for r in applied_h
+                )
+            )[:800]
+
+        df.at[idx, "regle_emprise_source"] = " / ".join(
+            dict.fromkeys(emprise_sources)
+        )[:500]
+        df.at[idx, "regle_hauteur_source"] = " / ".join(
+            dict.fromkeys(height_sources)
+        )[:500]
+        df.at[idx, "regle_emprise_extrait"] = " | ".join(
+            dict.fromkeys(emprise_excerpts)
+        )[:1100]
+        df.at[idx, "regle_hauteur_extrait"] = " | ".join(
+            dict.fromkeys(height_excerpts)
+        )[:1100]
+
+    return df
+
+
+def build_plu_commune_diagnostic(
+    partition,
+    documents,
+    zones_geojson,
+    graphic_prescriptions,
+    include_au,
+):
+    zones = zones_geojson.get("features", []) or []
+    retained = 0
+    excluded_nonconstructible = 0
+    excluded_economic = 0
+
+    for zf in zones:
+        props = zf.get("properties", {}) or {}
+        allowed, reason, _ = classify_zone_for_search(props, include_au=include_au)
+        if allowed:
+            retained += 1
+        else:
+            r = normalize_text(reason)
+            if "econom" in r or "industri" in r or "activite" in r:
+                excluded_economic += 1
+            else:
+                excluded_nonconstructible += 1
+
+    p38 = 0
+    p39 = 0
+    p02_01 = 0
+    for layer, fc in (graphic_prescriptions or {}).items():
+        for feat in fc.get("features", []) or []:
+            props = feat.get("properties", {}) or {}
+            t = _clean_psc_code(props.get("typepsc"))
+            st = _clean_psc_code(props.get("stypepsc"))
+            if t == "38" and st in {"00", "02"}:
+                p38 += 1
+            if t == "39" and st in {"00", "02", "50", "51"}:
+                p39 += 1
+            if t == "02" and st == "01":
+                p02_01 += 1
+
+    doc_props = {}
+    if documents:
+        doc_props = documents[0].get("properties", {}) or {}
+
+    date_doc = (
+        doc_props.get("datvalid")
+        or doc_props.get("datappro")
+        or doc_props.get("date_appro")
+        or ""
+    )
+    idurba = doc_props.get("idurba") or doc_props.get("id") or ""
+    typedoc = doc_props.get("typedoc") or doc_props.get("type_doc") or "PLU/PLUi"
+
+    return {
+        "partition": partition,
+        "typedoc": typedoc,
+        "idurba": idurba,
+        "date_document": str(date_doc),
+        "zones_total": len(zones),
+        "zones_retenues": retained,
+        "zones_non_constructibles_exclues": excluded_nonconstructible,
+        "zones_economiques_exclues": excluded_economic,
+        "prescriptions_emprise": p38,
+        "prescriptions_hauteur": p39,
+        "prescriptions_inconstructibles": p02_01,
+    }
+
+
 def analyse_commune(
     commune_name,
     insee,
@@ -1739,6 +2585,7 @@ def analyse_commune(
     batiments_geojson,
     zones_geojson,
     bdnb_parcel_index,
+    nonbuildable_index,
     include_au,
     habitat_only,
     include_conditionnel,
@@ -1746,33 +2593,37 @@ def analyse_commune(
     ratio_shab_pct,
     shab_par_logement,
 ):
+    """
+    V3.8 : comparaison géométrique réelle du dernier cadastre avec le PLU/PLUi.
+
+    Contrairement aux versions précédentes, on ne prend plus le point représentatif
+    de la parcelle ni la première zone rencontrée. La parcelle est réellement
+    intersectée avec toutes les zones du règlement graphique.
+    """
     zone_rows = []
     zone_geoms = []
-    for zf in zones_geojson.get("features", []):
+
+    for zf in zones_geojson.get("features", []) or []:
         zg = valid_shape(zf)
         if zg is None:
             continue
+
         props = zf.get("properties", {}) or {}
+        allowed, exclusion_reason, typezone = classify_zone_for_search(
+            props,
+            include_au=include_au,
+        )
         habitat = analyse_habitat_zone(
             props,
             include_au=include_au,
             include_conditionnel=include_conditionnel,
         )
-        typezone = habitat["typezone_normalise"]
-
-        # Sans filtre Habitat, on conserve U et AUc/AU, mais jamais A, N ou AUs.
-        base_constructible = (
-            typezone == "U"
-            or (include_au and typezone in {"AUc", "AU"})
-        )
-        allowed = base_constructible
-        if habitat_only:
-            allowed = allowed and habitat["habitat_eligible"]
 
         zone_rows.append(
             {
                 "geom": zg,
-                "allowed": allowed,
+                "allowed": bool(allowed),
+                "exclusion_reason": exclusion_reason,
                 "typezone": typezone,
                 "libelle": props.get("libelle") or "",
                 "libelong": props.get("libelong") or "",
@@ -1782,11 +2633,10 @@ def analyse_commune(
                 "destoui": props.get("destoui") or "",
                 "destcdt": props.get("destcdt") or "",
                 "destnon": props.get("destnon") or "",
-                "zone_class": habitat["habitat_statut"],
-                "habitat_eligible": habitat["habitat_eligible"],
-                "habitat_statut": habitat["habitat_statut"],
-                "habitat_preuve": habitat["habitat_preuve"],
-                "habitat_confiance": habitat["habitat_confiance"],
+                "habitat_eligible": habitat.get("habitat_eligible", False),
+                "habitat_statut": habitat.get("habitat_statut", ""),
+                "habitat_preuve": habitat.get("habitat_preuve", ""),
+                "habitat_confiance": habitat.get("habitat_confiance", 0),
                 "url_reglement": props.get("urlfic") or "",
                 "datvalid": props.get("datvalid") or props.get("datappro") or "",
             }
@@ -1794,15 +2644,13 @@ def analyse_commune(
         zone_geoms.append(zg)
 
     if not zone_geoms:
-        return pd.DataFrame(), []
+        return pd.DataFrame(), {}
 
     zone_tree = STRtree(zone_geoms)
 
-    # On indexe les centroïdes des bâtiments : si leur centroïde tombe dans la parcelle,
-    # on considère la parcelle comme bâtie.
     building_geoms = []
     building_centroids = []
-    for bf in batiments_geojson.get("features", []):
+    for bf in batiments_geojson.get("features", []) or []:
         bg = valid_shape(bf)
         if bg is None:
             continue
@@ -1814,26 +2662,114 @@ def analyse_commune(
     rows = []
     feature_map = {}
 
-    for pf in parcelles_geojson.get("features", []):
+    for pf in parcelles_geojson.get("features", []) or []:
         pg = valid_shape(pf)
         if pg is None:
             continue
 
-        rp = pg.representative_point()
-        zone_idx = zone_tree.query(rp, predicate="intersects")
-        if len(zone_idx) == 0:
+        parcel_area_geom = geodesic_area_m2(pg)
+        if parcel_area_geom <= 0:
             continue
 
-        # En cas de recouvrement, retenir la première zone candidate.
-        zi = int(zone_idx[0])
-        zr = zone_rows[zi]
-        if not zr["allowed"]:
+        zone_idxs = zone_tree.query(pg, predicate="intersects")
+        if len(zone_idxs) == 0:
             continue
+
+        eligible_pieces = []
+        eligible_zone_pieces = []
+        excluded_area = 0.0
+        overlap_details = []
+
+        for zi_raw in zone_idxs:
+            zi = int(zi_raw)
+            zr = zone_rows[zi]
+            try:
+                inter = pg.intersection(zr["geom"])
+            except Exception:
+                continue
+
+            if inter.is_empty:
+                continue
+
+            inter_area = geodesic_area_m2(inter)
+            if inter_area <= 0.05:
+                continue
+
+            overlap_details.append(
+                (
+                    inter_area,
+                    zr["libelle"],
+                    zr["typezone"],
+                    zr["allowed"],
+                    zr["exclusion_reason"],
+                )
+            )
+
+            if zr["allowed"]:
+                eligible_pieces.append(inter)
+                eligible_zone_pieces.append(
+                    {
+                        "geometry": mapping(inter),
+                        "zone_plu": zr["libelle"],
+                        "zone_description": zr["libelong"],
+                        "zone_type": zr["typezone"],
+                        "reglement_url": zr["url_reglement"],
+                        "date_zone": zr["datvalid"],
+                        "area_m2": inter_area,
+                        "economic_vocation": zr["economic_vocation"],
+                    }
+                )
+            else:
+                excluded_area += inter_area
+
+        if not eligible_pieces:
+            # Parcelle intégralement située en zone non constructible ou économique.
+            continue
+
+        eligible_geom = unary_union(eligible_pieces)
+
+        # Retrait des secteurs graphiques explicitement inconstructibles CNIG 02-01.
+        eligible_geom, removed_nonbuildable, nonbuildable_labels = (
+            subtract_nonbuildable_graphics(
+                eligible_geom,
+                nonbuildable_index,
+            )
+        )
+        eligible_area = geodesic_area_m2(eligible_geom)
+        if eligible_area <= 0.05:
+            continue
+
+        # Re-découper les pièces de zones pour retirer également les secteurs 02-01.
+        cleaned_zone_pieces = []
+        for zp in eligible_zone_pieces:
+            zg = shape(zp["geometry"])
+            cleaned_geom, _, _ = subtract_nonbuildable_graphics(
+                zg,
+                nonbuildable_index,
+            )
+            if cleaned_geom is None or cleaned_geom.is_empty:
+                continue
+            a = geodesic_area_m2(cleaned_geom)
+            if a <= 0.05:
+                continue
+            zpc = dict(zp)
+            zpc["geometry"] = mapping(cleaned_geom)
+            zpc["area_m2"] = a
+            cleaned_zone_pieces.append(zpc)
+
+        eligible_zone_pieces = cleaned_zone_pieces
+        if not eligible_zone_pieces:
+            continue
+
+        # Zone dominante uniquement pour l'affichage ; le calcul garde toutes
+        # les sous-zones constructibles séparément.
+        eligible_zone_pieces.sort(key=lambda x: x["area_m2"], reverse=True)
+        dominant = eligible_zone_pieces[0]
 
         pp = parcel_properties(pf)
         surface = pp["contenance"]
         if surface is None or surface <= 0:
-            surface = geodesic_area_m2(pg)
+            surface = parcel_area_geom
 
         built_count = 0
         built_footprint = 0.0
@@ -1842,40 +2778,58 @@ def analyse_commune(
             built_count = len(bidx)
             if built_count:
                 for bi in bidx:
-                    built_footprint += geodesic_area_m2(building_geoms[int(bi)])
+                    built_footprint += geodesic_area_m2(
+                        building_geoms[int(bi)]
+                    )
 
         terrain_bati = built_count > 0
 
         raw_ref = pp["id_parcelle"] or f"{insee}-{pp['section']}-{pp['numero']}"
         ref_norm = _normalise_parcelle_id(raw_ref)
-        bdnb_info = detect_collective_housing(bdnb_parcel_index.get(ref_norm, []))
+        bdnb_info = detect_collective_housing(
+            bdnb_parcel_index.get(ref_norm, [])
+        )
 
-        # Méthode de capacité définie par l'utilisateur :
-        # Surface brute -> SDP -> SHAB -> nombre de logements.
-        # À ce stade, faute de moteur de gabarit PLU complet, la surface cadastrale
-        # est utilisée comme base de "surface brute" de présélection.
-        surface_brute = float(surface)
-        sdp_estimee = surface_brute * (float(ratio_sdp_pct) / 100.0)
-        shab_estimee = sdp_estimee * (float(ratio_shab_pct) / 100.0)
-        logements = int(max(0, math.floor(shab_estimee / max(float(shab_par_logement), 1.0))))
+        # V3.8 : aucune capacité n'est inventée avant l'analyse emprise/hauteur.
+        surface_brute = None
+        sdp_estimee = None
+        shab_estimee = None
+        logements = None
 
-        # Score de présélection, pas un score juridique.
-        score = 50
-        if zr["zone_class"].startswith("U habitat"):
-            score += 20
-        elif zr["typezone"] == "U":
+        eligible_pct = min(
+            100.0,
+            100.0 * eligible_area / max(parcel_area_geom, 0.01),
+        )
+        excluded_pct = max(0.0, 100.0 - eligible_pct)
+
+        # Score de prospection basé sur la qualité spatiale de la partie constructible.
+        score = 55
+        if eligible_pct >= 95:
+            score += 15
+        elif eligible_pct >= 75:
+            score += 8
+        if float(surface) >= 1500:
             score += 10
-        if surface >= 1500:
-            score += 10
-        if surface >= 3000:
+        if float(surface) >= 3000:
             score += 5
         if not terrain_bati:
             score += 5
-        if zr["typezone"] == "AU":
-            score -= 10
+        if dominant["zone_type"] in {"AUc", "AU"}:
+            score -= 5
         score = max(0, min(100, score))
 
+        rp = eligible_geom.representative_point()
         ref = raw_ref
+
+        overlap_label = " / ".join(
+            f"{z} {round(100*a/max(parcel_area_geom,0.01))}%"
+            for a, z, _, allowed, _ in sorted(
+                overlap_details,
+                reverse=True,
+                key=lambda x: x[0],
+            )[:5]
+        )
+
         rows.append(
             {
                 "selection": False,
@@ -1886,9 +2840,15 @@ def analyse_commune(
                 "section": pp["section"],
                 "numero": pp["numero"],
                 "surface_m2": round(surface),
-                "surface_brute_m2": round(surface_brute),
-                "sdp_estimee_m2": round(sdp_estimee),
-                "shab_estimee_m2": round(shab_estimee),
+                "surface_plu_eligible_m2": round(eligible_area),
+                "surface_plu_exclue_m2": round(max(0.0, parcel_area_geom - eligible_area)),
+                "part_constructible_plu_pct": round(eligible_pct, 1),
+                "zones_intersectees": overlap_label,
+                "surface_inconstructible_graphique_m2": round(removed_nonbuildable),
+                "prescriptions_inconstructibles": " / ".join(nonbuildable_labels),
+                "surface_brute_m2": None,
+                "sdp_estimee_m2": None,
+                "shab_estimee_m2": None,
                 "ratio_sdp_pct": float(ratio_sdp_pct),
                 "ratio_shab_pct": float(ratio_shab_pct),
                 "shab_par_logement": float(shab_par_logement),
@@ -1897,29 +2857,30 @@ def analyse_commune(
                 "emprise_batie_m2": round(built_footprint),
                 "collectif_existant": bool(bdnb_info["collectif_existant"]),
                 "usage_bdnb": bdnb_info["usage_bdnb"],
-                "zone_type": zr["typezone"],
-                "zone_plu": zr["libelle"],
-                "zone_description": zr["libelong"],
-                "classe_zone": zr["zone_class"],
-                "habitat_eligible": bool(zr["habitat_eligible"]),
-                "habitat_statut": zr["habitat_statut"],
-                "habitat_preuve": zr["habitat_preuve"],
-                "habitat_confiance": int(zr["habitat_confiance"]),
-                "destoui": zr["destoui"],
-                "destcdt": zr["destcdt"],
-                "destnon": zr["destnon"],
-                "destdomi": zr["destdomi"],
-                "formdomi": zr["formdomi"],
-                "economic_vocation": bool(zr["economic_vocation"]),
-                "reglement_url": zr["url_reglement"],
-                "date_zone": zr["datvalid"],
-                "logements_estimes": logements,
+                "zone_type": dominant["zone_type"],
+                "zone_plu": dominant["zone_plu"],
+                "zone_description": dominant["zone_description"],
+                "classe_zone": "Constructible — analyse géométrique PLU/PLUi",
+                "habitat_eligible": True,
+                "habitat_statut": "Filtre habitat désactivé",
+                "habitat_preuve": "",
+                "habitat_confiance": 0,
+                "destoui": "",
+                "destcdt": "",
+                "destnon": "",
+                "destdomi": "",
+                "formdomi": "",
+                "economic_vocation": False,
+                "reglement_url": dominant["reglement_url"],
+                "date_zone": dominant["date_zone"],
+                "logements_estimes": None,
                 "score": score,
                 "latitude": rp.y,
                 "longitude": rp.x,
                 "adresse": bdnb_info["adresse_bdnb"],
             }
         )
+
         feature_map[ref] = {
             "type": "Feature",
             "properties": {
@@ -1927,17 +2888,18 @@ def analyse_commune(
                 "section": pp["section"],
                 "numero": pp["numero"],
                 "surface_m2": round(surface),
-                "sdp_m2": round(sdp_estimee),
-                "shab_m2": round(shab_estimee),
-                "zone": zr["libelle"],
-                "typezone": zr["typezone"],
-                "habitat": zr["habitat_statut"],
-                "vocation_economique": "Oui" if zr["economic_vocation"] else "Non",
-                "confiance_habitat": zr["habitat_confiance"],
+                "surface_constructible_plu": round(eligible_area),
+                "part_constructible_plu": round(eligible_pct, 1),
+                "surface_inconstructible_graphique": round(removed_nonbuildable),
+                "zone": dominant["zone_plu"],
+                "typezone": dominant["zone_type"],
                 "collectif": "Oui" if bdnb_info["collectif_existant"] else "Non",
-                "logements": logements,
+                "zones_intersectees": overlap_label,
             },
             "geometry": mapping(pg),
+            # Données internes d'analyse ; pydeck ignore ces clés.
+            "_analysis_geometry": mapping(eligible_geom),
+            "_zone_pieces": eligible_zone_pieces,
         }
 
     expected_columns = [
@@ -1949,6 +2911,12 @@ def analyse_commune(
         "section",
         "numero",
         "surface_m2",
+        "surface_plu_eligible_m2",
+        "surface_plu_exclue_m2",
+        "part_constructible_plu_pct",
+        "zones_intersectees",
+        "surface_inconstructible_graphique_m2",
+        "prescriptions_inconstructibles",
         "surface_brute_m2",
         "sdp_estimee_m2",
         "shab_estimee_m2",
@@ -1987,6 +2955,7 @@ def analyse_commune(
         "proprietaire_type",
         "proprietaire_commune",
     ]
+
     df = pd.DataFrame(rows)
     if df.empty:
         df = pd.DataFrame(columns=expected_columns)
@@ -2535,6 +3504,10 @@ def generate_selected_parcels_pdf(selected_df, commune_name, insee, feature_map)
                 Paragraph(f"<b>{_pdf_number(row.get('surface_m2'), 0, ' m²')}</b>", body),
             ],
             [
+                Paragraph("Surface en zones constructibles", small),
+                Paragraph(f"<b>{_pdf_number(row.get('surface_plu_eligible_m2'), 0, ' m²')}</b>", body),
+            ],
+            [
                 Paragraph("Zone PLU", small),
                 Paragraph(f"<b>{_pdf_escape(row.get('zone_plu'))}</b>", body),
             ],
@@ -2608,8 +3581,8 @@ def generate_selected_parcels_pdf(selected_df, commune_name, insee, feature_map)
             [
                 Paragraph("Logements estimés", small),
                 Paragraph("<b>" + _pdf_number(row.get("logements_plu"), 0) + "</b>", body),
-                Paragraph("Confiance gabarit", small),
-                Paragraph("<b>" + _pdf_number(row.get("gabarit_plu_confiance"), 0, " %") + "</b>", body),
+                Paragraph("Couverture emprise + hauteur", small),
+                Paragraph("<b>" + _pdf_number(row.get("gabarit_couverture_pct"), 0, " %") + "</b>", body),
             ],
         ]
         urban_table = Table(
@@ -2728,9 +3701,9 @@ def generate_selected_parcels_pdf(selected_df, commune_name, insee, feature_map)
 # --------------------------
 # Interface
 # --------------------------
-st.title("🏗️ Prospecteur Foncier — V3.7.4 — Prospection & dossier PDF")
+st.title("🏗️ Prospecteur Foncier — V3.8 — Analyse PLU/PLUi par commune")
 st.caption(
-    "Cadastre + PLU/PLUi + zonage PTZ + propriétaires personnes morales + lettres SAGEC + dossier PDF de sélection."
+    "Cadastre le plus récent + PLU/PLUi en vigueur + analyse précise emprise/hauteur par commune."
 )
 
 st.info(
@@ -2869,7 +3842,7 @@ with r4:
     )
 
 st.caption(
-    "Calcul graphique : surface brute = surface cadastrale × emprise maximale graphique × niveaux graphiques ; "
+    "Calcul précis : surface brute = somme des parties constructibles de la parcelle × emprise applicable × niveaux applicables ; "
     f"SDP × {ratio_sdp_pct:.0f} % ; SHAB × {ratio_shab_pct:.0f} % ; "
     f"{shab_par_logement:.0f} m² SHAB/logement."
 )
@@ -2896,10 +3869,10 @@ habitat_only = False
 include_conditionnel = True
 
 st.info(
-    "Mode stable V3.7.2 : le moteur utilise directement le cadastre, le zonage PLU/PLUi et "
-    "les prescriptions graphiques CNIG 38-02 (emprise maximale) et 39-02 (hauteur maximale). "
-    "L'analyse lourde de l'archive CNIG complète est temporairement retirée afin de garantir "
-    "le démarrage et la stabilité de l'application."
+    f"Analyse V3.8 spécifique à **{commune_name}** : le logiciel récupère le PLU/PLUi en vigueur, "
+    "intersecte réellement chaque parcelle du cadastre `latest` avec le règlement graphique, "
+    "puis recherche uniquement l'emprise au sol maximale et la hauteur maximale. "
+    "Les zones A/N/AUs et les secteurs économiques/industriels sont éliminés avant le calcul."
 )
 
 st.caption(
@@ -2914,10 +3887,9 @@ st.caption(
 )
 
 st.warning(
-    "Le moteur élimine d'abord les secteurs à vocation d'activités économiques (DESTDOMI=02, FORMDOMI 0200–0203 et libellés explicites). Le filtre Habitat réduit ensuite les faux positifs : il exploite d'abord les champs structurés "
-    "DESTOUI / DESTCDT / DESTNON du standard CNIG, puis DESTDOMI pour les anciens PLU et enfin "
-    "les libellés explicites de zone. Les règles de gabarit (hauteur, retraits, emprise, stationnement, "
-    "OAP, prescriptions et servitudes) restent à vérifier pour la faisabilité détaillée."
+    "La V3.8 se concentre volontairement sur deux règles seulement : **emprise au sol maximale** "
+    "et **hauteur maximale**. Les retraits, stationnement, OAP, servitudes et autres règles ne sont "
+    "pas intégrés au calcul de capacité de cette version."
 )
 
 analyse_button = st.button(
@@ -2949,9 +3921,27 @@ if analyse_button:
         with st.spinner(f"Chargement du zonage PLU/PLUi ({partition})…"):
             zones_geojson = fetch_gpu_zones(partition, insee=insee)
 
-        with st.spinner("Chargement des prescriptions graphiques PLU (emprise / hauteur)…"):
+        with st.spinner("Chargement des pièces graphiques emprise / hauteur du PLU/PLUi…"):
             graphic_prescriptions = fetch_gpu_graphic_prescriptions(partition, insee=insee)
             graphic_rule_indexes = build_graphic_rule_indexes(graphic_prescriptions)
+            nonbuildable_index = build_nonbuildable_graphic_index(
+                graphic_prescriptions
+            )
+
+        with st.spinner("Pré-interprétation des règles emprise/hauteur propres à la commune…"):
+            zone_rule_catalog = build_commune_zone_rule_catalog(
+                zones_geojson,
+                include_au=(zone_mode == "Zones U + AUc constructibles"),
+                floor_height_m=floor_height_m,
+            )
+
+        plu_diagnostic = build_plu_commune_diagnostic(
+            partition=partition,
+            documents=documents,
+            zones_geojson=zones_geojson,
+            graphic_prescriptions=graphic_prescriptions,
+            include_au=(zone_mode == "Zones U + AUc constructibles"),
+        )
 
         if not zones_geojson.get("features"):
             municipality = fetch_gpu_municipality(insee)
@@ -2970,6 +3960,7 @@ if analyse_button:
                 batiments_geojson=batiments_geojson,
                 zones_geojson=zones_geojson,
                 bdnb_parcel_index=bdnb_parcel_index,
+                nonbuildable_index=nonbuildable_index,
                 include_au=(zone_mode == "Zones U + AUc constructibles"),
                 habitat_only=habitat_only,
                 include_conditionnel=include_conditionnel,
@@ -2978,11 +3969,12 @@ if analyse_button:
                 shab_par_logement=shab_par_logement,
             )
 
-        with st.spinner("Croisement parcelles ↔ prescriptions graphiques 38/39…"):
-            results = enrich_with_graphic_plu_rules(
+        with st.spinner("Comparaison précise cadastre ↔ zones PLU ↔ emprise 38 ↔ hauteur 39…"):
+            results = enrich_with_precise_commune_rules(
                 results,
                 feature_map=feature_map,
                 rule_indexes=graphic_rule_indexes,
+                zone_rule_catalog=zone_rule_catalog,
                 ratio_sdp_pct=ratio_sdp_pct,
                 ratio_shab_pct=ratio_shab_pct,
                 shab_par_logement=shab_par_logement,
@@ -3004,6 +3996,8 @@ if analyse_button:
                     props["shab_plu"] = row.get("shab_plu_m2")
                     props["logements_plu"] = row.get("logements_plu")
                     props["statut_gabarit"] = row.get("gabarit_plu_statut")
+                    props["couverture_regles"] = row.get("gabarit_couverture_pct")
+                    props["surface_constructible_plu"] = row.get("surface_plu_eligible_m2")
 
         with st.spinner("Recherche des propriétaires personnes morales (sociétés / communes)…"):
             try:
@@ -3036,6 +4030,7 @@ if analyse_button:
         st.session_state["analysis_insee"] = insee
         st.session_state["analysis_commune"] = commune_name
         st.session_state["analysis_partition"] = partition
+        st.session_state["plu_diagnostic"] = plu_diagnostic
 
     except Exception as exc:
         st.error(
@@ -3091,18 +4086,35 @@ if results is not None and st.session_state.get("analysis_insee") == insee:
 
     if filtered.empty and not unresolved.empty:
         st.warning(
-            "Des parcelles candidates ont été trouvées, mais les prescriptions graphiques "
-            "d'emprise/hauteur ne sont pas assez complètes pour calculer leur capacité. "
-            "Elles restent visibles dans « Gabarit PLU à vérifier »."
+            "Les parcelles sont bien situées en zones constructibles non industrielles, "
+            "mais l'emprise et/ou la hauteur n'ont pas pu être chiffrées avec suffisamment de couverture. "
+            "Elles restent visibles dans « Emprise/hauteur à vérifier »."
         )
     elif filtered.empty and unresolved.empty:
         st.warning("Aucune parcelle ne correspond aux critères actuels.")
 
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Parcelles dans la cible logements", len(filtered))
-    m2.metric("Gabarit graphique à vérifier", len(unresolved))
+    m2.metric("Emprise/hauteur à vérifier", len(unresolved))
     m3.metric("Parcelles candidates analysées", len(results))
     m4.metric("Document urbanisme", st.session_state.get("analysis_partition", "—"))
+
+    diag = st.session_state.get("plu_diagnostic", {})
+    if diag:
+        date_doc = diag.get("date_document") or "date non renseignée"
+        st.success(
+            f"Document analysé pour {commune_name} : {diag.get('typedoc', 'PLU/PLUi')} "
+            f"— partition {diag.get('partition', '—')} — validation/approbation {date_doc}. "
+            f"{diag.get('zones_retenues', 0)} zone(s) constructible(s) retenue(s), "
+            f"{diag.get('zones_non_constructibles_exclues', 0)} zone(s) non constructible(s) exclue(s), "
+            f"{diag.get('zones_economiques_exclues', 0)} zone(s) économique(s)/industrielle(s) exclue(s)."
+        )
+        st.caption(
+            f"Pièces graphiques détectées : {diag.get('prescriptions_emprise', 0)} prescription(s) "
+            f"d'emprise 38, {diag.get('prescriptions_hauteur', 0)} prescription(s) de hauteur 39 "
+            f"et {diag.get('prescriptions_inconstructibles', 0)} secteur(s) inconstructible(s) 02-01. "
+            "Cadastre utilisé : flux Etalab `latest`."
+        )
 
     if st.session_state.get("analysis_partition", "").startswith("DU_") and code_epci:
         if st.session_state.get("analysis_partition") == f"DU_{code_epci}":
@@ -3163,6 +4175,7 @@ if results is not None and st.session_state.get("analysis_insee") == insee:
                     "html": (
                         "<b>{reference}</b><br/>"
                         "Surface terrain : {surface_m2} m²<br/>"
+                        "Part PLU constructible : {surface_constructible_plu} m²<br/>"
                         "Emprise PLU : {emprise_plu} %<br/>"
                         "Niveaux PLU : {niveaux_plu}<br/>"
                         "Hauteur PLU : {hauteur_plu} m<br/>"
@@ -3176,7 +4189,8 @@ if results is not None and st.session_state.get("analysis_insee") == insee:
                         "Type propriétaire : {type_proprietaire}<br/>"
                         "Zone : {typezone} {zone}<br/>"
                         "Potentiel PLU : {logements_plu} logements<br/>"
-                        "Gabarit : {statut_gabarit}"
+                        "Gabarit : {statut_gabarit}<br/>"
+                        "Couverture emprise+hauteur : {couverture_regles} %"
                     )
                 },
             )
@@ -3234,6 +4248,11 @@ if results is not None and st.session_state.get("analysis_insee") == insee:
                 "forme_juridique_proprietaire",
                 "siren_proprietaire",
                 "surface_m2",
+                "surface_plu_eligible_m2",
+                "part_constructible_plu_pct",
+                "zones_intersectees",
+                "surface_inconstructible_graphique_m2",
+                "prescriptions_inconstructibles",
                 "emprise_plu_pct",
                 "emprise_graphique_couverture_pct",
                 "niveaux_plu",
@@ -3257,6 +4276,11 @@ if results is not None and st.session_state.get("analysis_insee") == insee:
                 "logements_plu",
                 "gabarit_plu_statut",
                 "gabarit_plu_confiance",
+                "gabarit_couverture_pct",
+                "regle_emprise_source",
+                "regle_hauteur_source",
+                "regle_emprise_extrait",
+                "regle_hauteur_extrait",
                 "prescription_emprise",
                 "prescription_hauteur",
                 "prescription_url",
@@ -3282,6 +4306,11 @@ if results is not None and st.session_state.get("analysis_insee") == insee:
                 "forme_juridique_proprietaire": st.column_config.TextColumn("Forme juridique"),
                 "siren_proprietaire": st.column_config.TextColumn("SIREN"),
                 "surface_m2": st.column_config.NumberColumn("Surface terrain m²"),
+                "surface_plu_eligible_m2": st.column_config.NumberColumn("Surface en zones constructibles m²"),
+                "part_constructible_plu_pct": st.column_config.NumberColumn("Part constructible PLU %", format="%.1f %%"),
+                "zones_intersectees": st.column_config.TextColumn("Zones PLU intersectées"),
+                "surface_inconstructible_graphique_m2": st.column_config.NumberColumn("Surface exclue 02-01 m²"),
+                "prescriptions_inconstructibles": st.column_config.TextColumn("Secteurs inconstructibles"),
                 "emprise_plu_pct": st.column_config.NumberColumn("Emprise PLU %", format="%.1f %%"),
                 "emprise_graphique_couverture_pct": st.column_config.NumberColumn("Couverture emprise %", format="%.1f %%"),
                 "niveaux_plu": st.column_config.NumberColumn("Niveaux PLU"),
@@ -3307,6 +4336,11 @@ if results is not None and st.session_state.get("analysis_insee") == insee:
                 "logements_plu": st.column_config.NumberColumn("Logements PLU"),
                 "gabarit_plu_statut": st.column_config.TextColumn("Statut gabarit"),
                 "gabarit_plu_confiance": st.column_config.ProgressColumn("Confiance gabarit", min_value=0, max_value=100),
+                "gabarit_couverture_pct": st.column_config.ProgressColumn("Couverture règles", min_value=0, max_value=100),
+                "regle_emprise_source": st.column_config.TextColumn("Source emprise"),
+                "regle_hauteur_source": st.column_config.TextColumn("Source hauteur"),
+                "regle_emprise_extrait": st.column_config.TextColumn("Extrait règle emprise"),
+                "regle_hauteur_extrait": st.column_config.TextColumn("Extrait règle hauteur"),
                 "prescription_emprise": st.column_config.TextColumn("Prescription emprise"),
                 "prescription_hauteur": st.column_config.TextColumn("Prescription hauteur"),
                 "prescription_url": st.column_config.LinkColumn("Prescription"),
@@ -3325,6 +4359,11 @@ if results is not None and st.session_state.get("analysis_insee") == insee:
                 "forme_juridique_proprietaire",
                 "siren_proprietaire",
                 "surface_m2",
+                "surface_plu_eligible_m2",
+                "part_constructible_plu_pct",
+                "zones_intersectees",
+                "surface_inconstructible_graphique_m2",
+                "prescriptions_inconstructibles",
                 "emprise_plu_pct",
                 "emprise_graphique_couverture_pct",
                 "niveaux_plu",
@@ -3347,6 +4386,11 @@ if results is not None and st.session_state.get("analysis_insee") == insee:
                 "logements_plu",
                 "gabarit_plu_statut",
                 "gabarit_plu_confiance",
+                "gabarit_couverture_pct",
+                "regle_emprise_source",
+                "regle_hauteur_source",
+                "regle_emprise_extrait",
+                "regle_hauteur_extrait",
                 "prescription_emprise",
                 "prescription_hauteur",
                 "prescription_url",
