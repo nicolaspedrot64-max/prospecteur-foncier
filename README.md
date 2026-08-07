@@ -1,34 +1,25 @@
-# Prospecteur Foncier V3.3.1 — correctif API GPU / PLUi
+# Prospecteur Foncier V3.4 — Gabarit PLU
 
-Cette version corrige le plantage HTTP 500 observé sur Capbreton lors de l'appel :
+Le logiciel extrait maintenant automatiquement dans le règlement écrit :
+- l'emprise au sol maximale ;
+- le nombre de niveaux (R+N / niveaux explicites) ;
+- à défaut, la hauteur maximale convertie en niveaux.
 
-`/api/gpu/document?geom=...`
+Calcul :
+- Emprise constructible = Surface terrain × Emprise PLU
+- Surface brute = Emprise constructible × Nombre de niveaux
+- SDP = Surface brute × ratio SDP
+- SHAB = SDP × ratio SHAB
+- Logements = SHAB / SHAB moyenne par logement
 
-## Pourquoi Capbreton posait problème
+Si l'emprise ou les niveaux ne sont pas trouvés, le logiciel n'invente pas de valeur :
+la parcelle n'entre pas dans le calcul automatique.
 
-Capbreton est couvert par le PLUi de la Communauté de communes Maremne Adour Côte-Sud (MACS).
-Un PLUi est stocké dans le Géoportail de l'Urbanisme sous une partition de type :
+Un audit affiche la règle trouvée, son niveau de confiance, l'extrait du règlement et le lien PDF.
 
-`DU_<SIREN EPCI>`
+Limites restantes : retraits, bandes de constructibilité, pleine terre, stationnement,
+OAP, prescriptions graphiques et servitudes peuvent réduire la capacité réelle.
 
-La V3.3 dépendait trop du endpoint `/document?geom`. Si celui-ci renvoyait une erreur 500,
-l'analyse s'arrêtait.
-
-## Correctif
-
-La V3.3.1 :
-
-- récupère aussi le `codeEpci` via geo.api.gouv.fr ;
-- réessaie automatiquement les erreurs temporaires 500/502/503/504 ;
-- si `/gpu/document?geom` échoue, teste directement :
-  - `DU_<codeEpci>` pour les PLUi ;
-  - `DU_<codeINSEE>` pour les PLU communaux ;
-- vérifie la partition en interrogeant directement `zone-urba` ;
-- filtre un PLUi sur le code INSEE de la commune pour éviter de charger toutes les communes de l'EPCI.
-
-Pour Capbreton, le fallback attendu est le PLUi MACS.
-
-## Déploiement
-
-Remplacer uniquement `app.py` sur GitHub.
-Le `requirements.txt` de la V3.3 peut être conservé.
+Déploiement GitHub :
+- remplacer `app.py`
+- remplacer `requirements.txt` (ajout de `pypdf`)
