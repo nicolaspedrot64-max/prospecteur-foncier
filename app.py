@@ -31,6 +31,19 @@ CADASTRE_BASE_FALLBACK = "https://files.data.gouv.fr/cadastre/etalab-cadastre/la
 GPU_API = "https://apicarto.ign.fr/api/gpu"
 GEOCODAGE_API = "https://data.geopf.fr/geocodage"
 
+# Zonage A/B/C officiel utilisé notamment pour le PTZ.
+# Le dataset data.gouv.fr est maintenu par le ministère chargé du Logement.
+PTZ_ZONAGE_DATASET_API = (
+    "https://www.data.gouv.fr/api/1/datasets/"
+    "liste-des-communes-selon-le-zonage-abc/"
+)
+# Fallback : liste nationale en vigueur au 26 juin 2026
+# (arrêté du 23 juin 2026), au cas où la découverte dynamique du dataset échoue.
+PTZ_ZONAGE_FALLBACK_RESOURCE = (
+    "https://www.data.gouv.fr/api/1/datasets/r/"
+    "13f7282b-8a25-43ab-9713-8bb4e476df55"
+)
+
 # Fichier open data DGFiP des parcelles détenues par des personnes morales.
 # La ressource data.gouv.fr redirige vers le parquet courant.
 FPMU_PARCELLES_RESOURCE = (
@@ -73,7 +86,7 @@ REGIONS = {
 }
 
 st.set_page_config(
-    page_title="Prospecteur Foncier V3.7.2",
+    page_title="Prospecteur Foncier V3.7.3",
     page_icon="🏗️",
     layout="wide",
 )
@@ -84,7 +97,7 @@ st.set_page_config(
 BDNB_API = "https://api.bdnb.io/v1/bdnb/donnees/batiment_groupe_complet"
 
 HEADERS = {
-    "User-Agent": "ProspecteurFoncier/3.7.2 (Streamlit; donnees publiques)",
+    "User-Agent": "ProspecteurFoncier/3.7.3 (Streamlit; donnees publiques)",
     "Accept": "application/json, application/geo+json, */*",
 }
 
@@ -107,6 +120,149 @@ def fetch_communes(dept_code):
         timeout=30,
     )
     return sorted(data, key=lambda x: x.get("nom", ""))
+
+
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
+def fetch_ptz_zonage():
+    """
+    Charge le zonage A/B/C officiel en vigueur.
+
+    Le dataset est découvert dynamiquement via l'API data.gouv.fr afin que
+    l'application puisse suivre les futures mises à jour. Si cette découverte
+    échoue, on utilise la ressource nationale publiée pour le zonage en vigueur
+    au 26 juin 2026.
+    """
+    resource_url = PTZ_ZONAGE_FALLBACK_RESOURCE
+    source_label = "Zonage ABC en vigueur au 26 juin 2026"
+
+    try:
+        meta = http_get_json(PTZ_ZONAGE_DATASET_API, timeout=30)
+        resources = meta.get("resources", []) or []
+
+        csv_candidates = []
+        for res in resources:
+            fmt = str(res.get("format") or "").lower()
+            title = str(res.get("title") or res.get("description") or "")
+            url = str(res.get("url") or "")
+            haystack = f"{title} {url}".lower()
+
+            if fmt == "csv" or ".csv" in url.lower():
+                score = 0
+                if "ensemble" in haystack and "commune" in haystack:
+                    score += 10
+                if "zonage" in haystack and "abc" in haystack:
+                    score += 5
+                if "en vigueur" in haystack:
+                    score += 5
+                # Les ressources les plus récentes sont préférées en cas d'égalité.
+                modified = str(
+                    res.get("last_modified")
+                    or res.get("modified")
+                    or res.get("created_at")
+                    or ""
+                )
+                csv_candidates.append((score, modified, url, title))
+
+        if csv_candidates:
+            csv_candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
+            _, _, discovered_url, discovered_title = csv_candidates[0]
+            if discovered_url:
+                resource_url = discovered_url
+                source_label = discovered_title or source_label
+    except Exception:
+        pass
+
+    r = requests.get(resource_url, headers=HEADERS, timeout=45)
+    r.raise_for_status()
+
+    # Le CSV ministériel est séparé par des points-virgules.
+    df = pd.read_csv(
+        io.StringIO(r.text),
+        sep=";",
+        dtype=str,
+        keep_default_na=False,
+    )
+
+    # Normaliser les noms de colonnes pour résister aux changements de millésime.
+    cols = {str(c).strip().lower(): c for c in df.columns}
+
+    code_col = None
+    zone_col = None
+    name_col = None
+
+    for c in df.columns:
+        lc = str(c).strip().lower()
+        if code_col is None and (
+            lc == "codgeo"
+            or "code insee" in lc
+            or ("code" in lc and "commune" in lc)
+        ):
+            code_col = c
+        if zone_col is None and "zonage" in lc and "abc" in lc:
+            zone_col = c
+        if name_col is None and (
+            lc == "libgeo"
+            or "nom commune" in lc
+            or ("libell" in lc and "commune" in lc)
+        ):
+            name_col = c
+
+    if code_col is None or zone_col is None:
+        raise RuntimeError(
+            "Le fichier officiel de zonage PTZ a changé de structure "
+            "et ses colonnes n'ont pas pu être identifiées."
+        )
+
+    result = {}
+    for _, row in df.iterrows():
+        insee = str(row.get(code_col) or "").strip().zfill(5)
+        zone = str(row.get(zone_col) or "").strip()
+        if not insee or not zone:
+            continue
+
+        # Uniformiser quelques variantes de typographie.
+        z_norm = normalize_text(zone).replace(" ", "")
+        if z_norm in {"abis", "a-bis"}:
+            zone = "Abis"
+        elif z_norm == "a":
+            zone = "A"
+        elif z_norm == "b1":
+            zone = "B1"
+        elif z_norm == "b2":
+            zone = "B2"
+        elif z_norm == "c":
+            zone = "C"
+
+        result[insee] = {
+            "zone": zone,
+            "nom": str(row.get(name_col) or "").strip() if name_col else "",
+        }
+
+    return result, source_label
+
+
+def filter_communes_by_ptz(communes, ptz_choice, zonage_index):
+    """
+    Filtre une liste de communes geo.api.gouv.fr avec le zonage officiel ABC.
+
+    Conformément au Code de la construction et de l'habitation, la zone A bis
+    est incluse dans la zone A. Le filtre 'A' conserve donc A + A bis.
+    """
+    if ptz_choice == "Tous":
+        return communes
+
+    allowed = {"Abis", "A"} if ptz_choice == "A" else {ptz_choice}
+
+    filtered = []
+    for commune in communes:
+        code = str(commune.get("code") or "").zfill(5)
+        info = zonage_index.get(code, {})
+        if info.get("zone") in allowed:
+            c = dict(commune)
+            c["zone_ptz"] = info.get("zone")
+            filtered.append(c)
+
+    return filtered
 
 
 def _dept_from_insee(insee):
@@ -1710,6 +1866,7 @@ def analyse_commune(
                 "selection": False,
                 "ville": commune_name,
                 "code_insee": insee,
+                "zone_ptz": zone_ptz_commune,
                 "reference": ref,
                 "section": pp["section"],
                 "numero": pp["numero"],
@@ -1772,6 +1929,7 @@ def analyse_commune(
         "selection",
         "ville",
         "code_insee",
+        "zone_ptz",
         "reference",
         "section",
         "numero",
@@ -1904,14 +2062,15 @@ def generate_letter(row, signataire, fonction, email, ville_signature):
 # --------------------------
 # Interface
 # --------------------------
-st.title("🏗️ Prospecteur Foncier — V3.7.2 — Mode stable")
+st.title("🏗️ Prospecteur Foncier — V3.7.3 — Mode stable + zonage PTZ")
 st.caption(
-    "Mode stable : cadastre réel + zonage PLU/PLUi + prescriptions graphiques CNIG 38/39 + propriétaires personnes morales."
+    "Mode stable : cadastre + PLU/PLUi + prescriptions graphiques + propriétaires personnes morales + filtre zonage PTZ."
 )
 
 st.info(
-    "Cette V2 ne travaille plus sur Bayonne/Anglet en dur. Les communes sont chargées "
-    "depuis l'API administrative officielle. Les parcelles et bâtiments viennent du cadastre réel."
+    "Les communes sont chargées depuis l'API administrative officielle. "
+    "Le nouveau filtre de zonage PTZ utilise la liste A/B/C officielle du ministère chargé du Logement. "
+    "Les parcelles et bâtiments viennent du cadastre réel."
 )
 
 with st.sidebar:
@@ -1932,15 +2091,56 @@ with st.sidebar:
     dep_label = st.selectbox("Département", list(dep_label_to_code.keys()))
     dep_code = dep_label_to_code[dep_label]
 
+    # Filtre PTZ demandé : placé avant le choix de la commune.
+    ptz_choice = st.selectbox(
+        "Zonage PTZ",
+        ["Tous", "A", "B1", "B2", "C"],
+        index=0,
+        help=(
+            "Zonage A/B/C officiel utilisé notamment pour le PTZ. "
+            "Le choix A inclut également A bis, conformément au classement réglementaire."
+        ),
+    )
+
     try:
         communes = fetch_communes(dep_code)
     except Exception as exc:
         st.error(f"Impossible de charger les communes : {exc}")
         st.stop()
 
-    commune_labels = {
-        f"{c['nom']} ({c['code']})": c for c in communes
-    }
+    ptz_zonage_index = {}
+    ptz_source = ""
+    try:
+        ptz_zonage_index, ptz_source = fetch_ptz_zonage()
+        communes = filter_communes_by_ptz(
+            communes,
+            ptz_choice,
+            ptz_zonage_index,
+        )
+    except Exception as exc:
+        if ptz_choice != "Tous":
+            st.warning(
+                "Le zonage PTZ officiel n'a pas pu être chargé ; "
+                "le filtre PTZ est temporairement ignoré. "
+                f"Détail : {exc}"
+            )
+
+    if not communes:
+        st.warning(
+            f"Aucune commune du département sélectionné n'est classée en zone PTZ {ptz_choice}."
+        )
+        st.stop()
+
+    commune_labels = {}
+    for c in communes:
+        zone_ptz = (
+            c.get("zone_ptz")
+            or ptz_zonage_index.get(str(c.get("code") or "").zfill(5), {}).get("zone")
+            or ""
+        )
+        suffix = f" — PTZ {zone_ptz}" if zone_ptz else ""
+        commune_labels[f"{c['nom']} ({c['code']}){suffix}"] = c
+
     commune_label = st.selectbox(
         "Commune",
         list(commune_labels.keys()),
@@ -1950,6 +2150,13 @@ with st.sidebar:
     commune_name = commune["nom"]
     insee = commune["code"]
     code_epci = commune.get("codeEpci")
+    zone_ptz_commune = (
+        commune.get("zone_ptz")
+        or ptz_zonage_index.get(str(insee).zfill(5), {}).get("zone")
+        or "Non renseigné"
+    )
+
+    st.caption(f"Commune sélectionnée : zone PTZ **{zone_ptz_commune}**")
 
 st.subheader("1. Critères de recherche")
 
@@ -2374,6 +2581,8 @@ if results is not None and st.session_state.get("analysis_insee") == insee:
                 "nb_batiments",
                 "zone_type",
                 "zone_plu",
+                "zone_ptz",
+                "zone_ptz",
                 "habitat_statut",
                 "habitat_preuve",
                 "habitat_confiance",
@@ -2421,6 +2630,7 @@ if results is not None and st.session_state.get("analysis_insee") == insee:
                 "nb_batiments": st.column_config.NumberColumn("Nb bâtiments"),
                 "zone_type": st.column_config.TextColumn("Type zone"),
                 "zone_plu": st.column_config.TextColumn("Zone PLU"),
+                "zone_ptz": st.column_config.TextColumn("Zone PTZ"),
                 "habitat_statut": st.column_config.TextColumn("Statut habitat"),
                 "habitat_preuve": st.column_config.TextColumn("Preuve habitat"),
                 "habitat_confiance": st.column_config.ProgressColumn(
