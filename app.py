@@ -9,8 +9,8 @@ import streamlit as st
 from docx import Document
 
 APP_DIR = Path(__file__).parent
-DEFAULT_DATA = APP_DIR / "data" / "parcelles_exemple.csv"
-LETTER_TEMPLATE = APP_DIR / "assets" / "lettre_sagec_modele.docx"
+DEFAULT_DATA = APP_DIR / "parcelles_exemple.csv"
+LETTER_TEMPLATE = APP_DIR / "lettre_sagec_modele.docx"
 
 st.set_page_config(page_title="Prospecteur Foncier", page_icon="🏗️", layout="wide")
 
