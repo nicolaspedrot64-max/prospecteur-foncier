@@ -1,29 +1,28 @@
-# Prospecteur Foncier V3.7.1 — correctif stabilité
+# Prospecteur Foncier V3.7.2 — Mode stable
 
-Cette version corrige le comportement de la V3.7 qui pouvait donner l'impression
-que l'application ne fonctionnait plus.
+Cette version est une version de secours volontairement basée sur le dernier socle
+qui fonctionnait correctement dans Streamlit : le moteur V3.5.
 
-## Changements
+Elle conserve :
+- cadastre réel ;
+- PLU/PLUi ;
+- exclusion des secteurs à vocation économique ;
+- exclusion du résidentiel collectif existant ;
+- propriétaires personnes morales / communes ;
+- prescriptions graphiques CNIG 38-02 (emprise maximale) ;
+- prescriptions graphiques CNIG 39-02 (hauteur maximale) ;
+- calcul surface brute / SDP / SHAB / logements ;
+- carte, sélection et courriers.
 
-- L'analyse de l'archive CNIG complète est désormais **optionnelle et décochée par défaut**.
-- Le téléchargement d'un gros PLUi ne bloque plus le parcours normal.
-- Le filtre nombre de logements repose d'abord sur le gabarit emprise/hauteur.
-- Les reculs / pleine terre / contraintes avancées restent des informations de préfaisabilité
-  et ne suppriment plus silencieusement les parcelles.
-- Le mode de recul prudent est désactivé par défaut.
-- Les parcelles sans gabarit calculé restent **visibles et sélectionnables**.
-- Si des parcelles calculées existent, un second éditeur permet aussi de sélectionner
-  les parcelles « à vérifier ».
-- Une erreur de l'archive CNIG devient un message d'information ; l'analyse continue.
-
-## Pourquoi
-
-Depuis 2026, certains gros documents PLUi du GPU sont lourds et leurs archives ont été
-réorganisées / scindées. Une application Streamlit ne doit pas dépendre du téléchargement
-de l'archive complète pour simplement afficher les parcelles.
+Elle retire temporairement :
+- téléchargement de l'archive CNIG complète ;
+- lecture directe des shapefiles de l'archive ;
+- dépendances pypdf / pyshp introduites dans les versions avancées.
 
 ## Déploiement
 
-Remplacer uniquement `app.py`.
+IMPORTANT : remplacer les DEUX fichiers sur GitHub :
+1. app.py
+2. requirements.txt
 
-Le `requirements.txt` de la V3.7 peut être conservé.
+Cela force Streamlit à reconstruire un environnement plus léger.
