@@ -1,71 +1,29 @@
-# Prospecteur Foncier V3.7 — Préfaisabilité PLU renforcée
+# Prospecteur Foncier V3.7.1 — correctif stabilité
 
-Cette version ajoute une vraie **base de règles PLU pré-interprétées par zone**.
+Cette version corrige le comportement de la V3.7 qui pouvait donner l'impression
+que l'application ne fonctionnait plus.
 
-## 1. Archive CNIG complète
+## Changements
 
-Le logiciel utilise désormais le service officiel :
+- L'analyse de l'archive CNIG complète est désormais **optionnelle et décochée par défaut**.
+- Le téléchargement d'un gros PLUi ne bloque plus le parcours normal.
+- Le filtre nombre de logements repose d'abord sur le gabarit emprise/hauteur.
+- Les reculs / pleine terre / contraintes avancées restent des informations de préfaisabilité
+  et ne suppriment plus silencieusement les parcelles.
+- Le mode de recul prudent est désactivé par défaut.
+- Les parcelles sans gabarit calculé restent **visibles et sélectionnables**.
+- Si des parcelles calculées existent, un second éditeur permet aussi de sélectionner
+  les parcelles « à vérifier ».
+- Une erreur de l'archive CNIG devient un message d'information ; l'analyse continue.
 
-`/api/document/download-by-partition/<partition>`
+## Pourquoi
 
-pour récupérer l'archive CNIG du PLU/PLUi.
-
-L'intérêt est important : l'API Carto fournit les objets graphiques, mais l'archive
-peut aussi contenir les attributs supplémentaires `LIB_ATTR / LIB_VAL` publiés par
-la collectivité.
-
-Ces attributs sont notamment utilisés par le standard CNIG pour :
-- l'emprise maximale (38-02 / COEF_EMPRISE_SOL_MAX) ;
-- la hauteur (39-02 / HAUTEUR_METRES_MAX ou HAUTEUR_RPLUS_ETAGES) ;
-- les reculs d'implantation (15 / VALEUR DE RECUL) ;
-- le coefficient de biotope (42).
-
-## 2. Base de règles par zone
-
-Une seule lecture du règlement est effectuée par zone pour pré-interpréter :
-- emprise maximale ;
-- hauteur / niveaux ;
-- recul par rapport aux voies ;
-- recul aux limites latérales ;
-- recul en fond de parcelle ;
-- pleine terre / espaces verts ;
-- stationnement par logement.
-
-La base obtenue est affichée dans l'application et exportable en CSV.
-
-## 3. Prescriptions graphiques supplémentaires
-
-Le moteur analyse :
-- 02 : limitations / interdictions de constructibilité ;
-- 05 : emplacements réservés ;
-- 15 : règles d'implantation / reculs ;
-- 18 : OAP ;
-- 38 : emprise ;
-- 39 : hauteur ;
-- 42 : biotope.
-
-## 4. Capacité corrigée
-
-Le calcul initial emprise × niveaux est ensuite corrigé :
-- par une enveloppe prudente liée aux reculs ;
-- par la pleine terre / le biotope ;
-- par une éventuelle interdiction graphique.
-
-Le tableau distingue :
-- logements gabarit ;
-- logements corrigés ;
-- logements retenus.
-
-## Prudence
-
-Le mode « reculs prudents » applique le plus grand recul trouvé à tout le contour
-de la parcelle faute d'identifier encore parfaitement la façade sur rue.
-Il est donc volontairement conservateur.
+Depuis 2026, certains gros documents PLUi du GPU sont lourds et leurs archives ont été
+réorganisées / scindées. Une application Streamlit ne doit pas dépendre du téléchargement
+de l'archive complète pour simplement afficher les parcelles.
 
 ## Déploiement
 
-Remplacer :
-- `app.py`
-- `requirements.txt`
+Remplacer uniquement `app.py`.
 
-Nouvelle dépendance : `pyshp`.
+Le `requirements.txt` de la V3.7 peut être conservé.

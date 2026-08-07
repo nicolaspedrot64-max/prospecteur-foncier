@@ -86,7 +86,7 @@ REGIONS = {
 }
 
 st.set_page_config(
-    page_title="Prospecteur Foncier V3.7",
+    page_title="Prospecteur Foncier V3.7.1",
     page_icon="🏗️",
     layout="wide",
 )
@@ -97,7 +97,7 @@ st.set_page_config(
 BDNB_API = "https://api.bdnb.io/v1/bdnb/donnees/batiment_groupe_complet"
 
 HEADERS = {
-    "User-Agent": "ProspecteurFoncier/3.7 (Streamlit; donnees publiques)",
+    "User-Agent": "ProspecteurFoncier/3.7.1 (Streamlit; donnees publiques)",
     "Accept": "application/json, application/geo+json, */*",
 }
 
@@ -886,7 +886,7 @@ def fetch_cnig_archive_layers(partition):
     Le résultat est mis en cache une semaine et ne conserve pas l'archive ZIP brute.
     """
     url = GPU_ARCHIVE_API.format(partition=partition)
-    r = requests.get(url, headers=HEADERS, timeout=240)
+    r = requests.get(url, headers=HEADERS, timeout=60)
     r.raise_for_status()
 
     if r.content[:2] != b"PK":
@@ -2450,7 +2450,7 @@ def generate_letter(row, signataire, fonction, email, ville_signature):
 # --------------------------
 # Interface
 # --------------------------
-st.title("🏗️ Prospecteur Foncier — V3.7 — Préfaisabilité PLU")
+st.title("🏗️ Prospecteur Foncier — V3.7.1 — Préfaisabilité PLU stable")
 st.caption(
     "Cadastre + archive CNIG complète + règles pré-interprétées + contraintes par parcelle."
 )
@@ -2569,16 +2569,16 @@ habitat_only = False
 include_conditionnel = True
 
 st.info(
-    "Méthode V3.7 : le logiciel télécharge aussi l'archive CNIG complète du PLU/PLUi afin de lire "
-    "les attributs supplémentaires publiés par la collectivité (LIB_ATTR/LIB_VAL). "
-    "Il combine ensuite zonage, emprise, hauteur, reculs, biotope/pleine terre, OAP et autres prescriptions."
+    "Méthode V3.7.1 : le moteur principal reste léger et robuste (cadastre + zonage + prescriptions "
+    "graphiques + règlement écrit). L'archive CNIG complète devient une analyse avancée optionnelle, "
+    "afin qu'un gros PLUi ne bloque plus toute la prospection."
 )
 
 x1, x2 = st.columns(2)
 with x1:
     analyse_cnig_complete = st.checkbox(
         "Analyse renforcée de l'archive CNIG complète",
-        value=True,
+        value=False,
         help=(
             "Permet notamment de récupérer les attributs complémentaires des prescriptions "
             "qui ne remontent pas toujours dans l'API Carto."
@@ -2587,7 +2587,7 @@ with x1:
 with x2:
     appliquer_reculs_prudents = st.checkbox(
         "Appliquer les reculs au calcul (mode prudent)",
-        value=True,
+        value=False,
         help=(
             "En l'absence d'identification parfaite de chaque façade de parcelle, "
             "le plus grand recul trouvé est appliqué à tout le contour. "
@@ -2806,9 +2806,13 @@ if results is not None and st.session_state.get("analysis_insee") == insee:
         errors="coerce",
     )
 
-    # Priorité au calcul corrigé par contraintes ; fallback au gabarit emprise/hauteur.
-    results["logements_retenus"] = results["logements_corriges"].combine_first(
-        results["logements_plu"]
+    # V3.7.1 stable :
+    # le filtre de prospection repose d'abord sur le gabarit emprise/hauteur.
+    # Les contraintes avancées (reculs, pleine terre, etc.) restent visibles comme
+    # préfaisabilité complémentaire, mais ne font plus disparaître silencieusement
+    # les parcelles de la prospection.
+    results["logements_retenus"] = results["logements_plu"].combine_first(
+        results["logements_corriges"]
     )
 
     calculable = results["logements_retenus"].notna()
@@ -2817,7 +2821,6 @@ if results is not None and st.session_state.get("analysis_insee") == insee:
         calculable
         & (results["logements_retenus"] >= min_log)
         & (results["logements_retenus"] <= max_log)
-        & (results["interdiction_constructibilite"] != True)
     ].copy()
 
     unresolved = results[~calculable].copy()
@@ -2854,7 +2857,7 @@ if results is not None and st.session_state.get("analysis_insee") == insee:
         st.warning("Aucune parcelle ne correspond aux critères actuels.")
 
     m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Parcelles dans la cible logements corrigée", len(filtered))
+    m1.metric("Parcelles dans la cible logements", len(filtered))
     m2.metric("Gabarit à vérifier", len(unresolved))
     m3.metric("Parcelles candidates analysées", len(results))
     m4.metric("Document urbanisme", st.session_state.get("analysis_partition", "—"))
@@ -2881,9 +2884,9 @@ if results is not None and st.session_state.get("analysis_insee") == insee:
         )
 
     if st.session_state.get("archive_error"):
-        st.warning(
-            "L'archive CNIG complète n'a pas pu être exploitée. Le logiciel continue avec l'API Carto "
-            "et le règlement écrit. Détail : " + st.session_state["archive_error"]
+        st.info(
+            "Analyse CNIG complète indisponible pour ce document : le logiciel a continué normalement "
+            "avec l'API Carto et le règlement écrit. Détail : " + st.session_state["archive_error"]
         )
 
     archive_info = st.session_state.get("archive_info", {})
@@ -3012,14 +3015,18 @@ if results is not None and st.session_state.get("analysis_insee") == insee:
                 )
 
         st.subheader("3. Sélection des parcelles")
-        if filtered.empty:
+        # Si le moteur n'a pas réussi à calculer un gabarit sur certaines parcelles,
+        # elles restent prospectables : on permet leur sélection au lieu d'arrêter l'application.
+        if filtered.empty and not unresolved.empty:
             st.info(
-                "Aucune parcelle n'est encore sélectionnable par nombre de logements calculé. "
-                "Consulte la liste « Gabarit PLU à vérifier »."
+                "Aucune parcelle n'a un nombre de logements calculé dans la plage choisie, "
+                "mais les parcelles à vérifier restent sélectionnables ci-dessous."
             )
-            st.stop()
+            table_source = unresolved.copy()
+        else:
+            table_source = filtered.copy()
 
-        table = filtered[
+        table = table_source[
             [
                 "selection",
                 "reference",
@@ -3214,6 +3221,59 @@ if results is not None and st.session_state.get("analysis_insee") == insee:
         )
 
         selected = edited[edited["selection"] == True].copy()
+
+        # Sélection complémentaire des parcelles dont le gabarit n'a pas été calculé.
+        selected_unresolved = pd.DataFrame()
+        if not unresolved.empty and not filtered.empty:
+            with st.expander(
+                f"Sélectionner aussi des parcelles à vérifier ({len(unresolved)})",
+                expanded=False,
+            ):
+                ucols = [
+                    "selection",
+                    "reference",
+                    "section",
+                    "numero",
+                    "surface_m2",
+                    "zone_plu",
+                    "gabarit_plu_statut",
+                    "regle_zone_emprise",
+                    "regle_zone_hauteur",
+                    "proprietaire_personne_morale",
+                    "latitude",
+                    "longitude",
+                    "adresse",
+                ]
+                utable = unresolved[[c for c in ucols if c in unresolved.columns]].copy()
+                uedited = st.data_editor(
+                    utable,
+                    hide_index=True,
+                    use_container_width=True,
+                    column_config={
+                        "selection": st.column_config.CheckboxColumn("Sélectionner"),
+                        "reference": st.column_config.TextColumn("Référence"),
+                        "surface_m2": st.column_config.NumberColumn("Surface terrain m²"),
+                        "zone_plu": st.column_config.TextColumn("Zone PLU"),
+                        "gabarit_plu_statut": st.column_config.TextColumn("Statut"),
+                        "latitude": None,
+                        "longitude": None,
+                    },
+                    disabled=[
+                        c for c in utable.columns if c != "selection"
+                    ],
+                    key="unresolved_editor",
+                )
+                selected_unresolved = uedited[
+                    uedited.get("selection", False) == True
+                ].copy()
+
+        if not selected_unresolved.empty:
+            selected = pd.concat(
+                [selected, selected_unresolved],
+                ignore_index=True,
+                sort=False,
+            ).drop_duplicates(subset=["reference"])
+
         st.write(f"**{len(selected)} parcelle(s) sélectionnée(s)**")
 
         if not selected.empty:
