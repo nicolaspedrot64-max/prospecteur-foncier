@@ -1,44 +1,37 @@
-# Prospecteur Foncier — MVP
+# Prospecteur Foncier V2
 
-Prototype Streamlit pour :
-- saisir des critères (ville, nombre de logements, PC, terrain nu/bâti, surface, score) ;
-- éliminer automatiquement les parcelles marquées non constructibles ;
-- afficher la liste des parcelles répondant aux critères ;
-- sélectionner les parcelles à prospecter ;
-- générer des courriers DOCX personnalisés à partir du modèle SAGEC fourni.
+Cette version remplace les données de démonstration Bayonne/Anglet par des données publiques réelles.
 
-## Installation
+## Sources utilisées
 
-```bash
-python -m venv .venv
-# Windows
-.venv\Scripts\activate
-# macOS / Linux
-source .venv/bin/activate
+- Communes : API Découpage administratif (`geo.api.gouv.fr`)
+- Parcelles et bâtiments : Cadastre Etalab, dernier millésime
+- PLU / PLUi : API Carto IGN, module Géoportail de l'Urbanisme
+- Adresses : Service de géocodage de la Géoplateforme
+- Courriers : modèle SAGEC `lettre_sagec_modele.docx`
 
-pip install -r requirements.txt
-streamlit run app.py
-```
+## Mise à jour sur GitHub
 
-## Données
+Remplacer votre ancien `app.py` et `requirements.txt` par ceux de cette V2.
+Ajouter `lettre_sagec_modele.docx` à la racine du dépôt si ce n'est pas déjà fait.
 
-Le fichier `data/parcelles_exemple.csv` sert de démonstration.
+Streamlit redéploiera automatiquement l'application après le commit.
 
-Colonnes attendues :
-- ville
-- adresse
-- section
-- numero
-- surface_m2
-- zone_plu
-- constructible
-- terrain_bati
-- pc_obtenu
-- logements_estimes
-- score
+## Ce que la V2 fait
 
-## Important
+- choix dynamique d'une commune de Nouvelle-Aquitaine ou d'Occitanie ;
+- téléchargement du vrai cadastre de la commune ;
+- téléchargement des bâtiments ;
+- récupération du document PLU/PLUi et de son zonage ;
+- exclusion des zones A/N ;
+- analyse des zones U et, au choix, AU ;
+- détection terrain nu/bâti ;
+- estimation de capacité logement ;
+- carte réelle des parcelles ;
+- sélection, recherche d'adresse et génération de lettres.
 
-Cette version est un MVP fonctionnel de l'interface et du moteur de filtrage.
-Elle ne se connecte pas encore automatiquement au cadastre, au PLU/PLUi ni aux autorisations d'urbanisme.
-Ces connexions seront la prochaine étape pour transformer le prototype en outil opérationnel.
+## Limite à connaître
+
+Le nombre de logements est encore une estimation de présélection. Pour une faisabilité réglementaire
+plus précise, il faut développer un moteur de lecture automatique des règlements écrits du PLU
+(emprise, hauteur, retraits, stationnement, pleine terre, destinations, OAP, prescriptions, etc.).
