@@ -1,0 +1,10 @@
+{
+  "project": "Prospecteur Foncier",
+  "version": "0.1.0-mvp",
+  "features": [
+    "filtrage critères",
+    "exclusion terrains non constructibles",
+    "sélection parcelles",
+    "génération courriers DOCX personnalisés"
+  ]
+}

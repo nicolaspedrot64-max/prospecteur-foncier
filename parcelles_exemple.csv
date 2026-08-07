@@ -1,0 +1,6 @@
+selection,ville,adresse,section,numero,surface_m2,zone_plu,constructible,terrain_bati,pc_obtenu,logements_estimes,score,latitude,longitude
+False,BAYONNE,18 avenue de la Gare,AB,125,2150,UB,True,True,False,24,94,43.4929,-1.4748
+False,BAYONNE,6 rue des Écoles,AC,84,3020,UB,True,False,False,36,91,43.4909,-1.468
+False,BAYONNE,12 chemin du Lac,AD,18,1870,UC,True,True,True,20,88,43.4855,-1.4772
+False,BAYONNE,4 route des Pins,AE,44,4100,N,False,False,False,0,5,43.5002,-1.4592
+False,ANGLET,25 avenue de Biarritz,BC,211,2650,UC,True,True,False,28,90,43.4823,-1.5231
