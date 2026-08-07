@@ -1,48 +1,66 @@
-# Prospecteur Foncier V3.6 — moteur PLU hybride
+# Prospecteur Foncier V3.7 — Préfaisabilité PLU renforcée
 
-Cette version vise à se rapprocher d'une préfaisabilité de type outil métier.
+Cette version ajoute une vraie **base de règles PLU pré-interprétées par zone**.
 
-## Pourquoi la V3.5 était limitée
+## 1. Archive CNIG complète
 
-API Carto restitue les géométries et les attributs principaux des prescriptions,
-mais sa documentation utilisateur ne liste pas les attributs complémentaires CNIG
-`LIB_ATTRn / LIB_VALn` où peuvent se trouver `COEF_EMPRISE_SOL_MAX`,
-`HAUTEUR_METRES_MAX` ou `HAUTEUR_RPLUS_ETAGES`.
+Le logiciel utilise désormais le service officiel :
 
-Le moteur V3.5 pouvait donc connaître le périmètre d'une prescription 38/39
-sans disposer de sa valeur chiffrée.
+`/api/document/download-by-partition/<partition>`
 
-## Stratégie V3.6
+pour récupérer l'archive CNIG du PLU/PLUi.
 
-1. Identifier la zone PLU/PLUi de la parcelle.
-2. Lire une seule fois le règlement écrit lié à cette zone via `URLFIC`.
-3. Extraire une règle de base :
-   - emprise au sol maximale ;
-   - R+N / nombre de niveaux / hauteur maximale.
-4. Charger les prescriptions graphiques :
-   - 38-02 : emprise maximale ;
-   - 39-02 : hauteur maximale.
-5. Si une prescription graphique n'a pas de valeur dans l'API, lire uniquement
-   le document pointé par son `URLFIC`.
-6. Découper géométriquement la parcelle en sous-surfaces :
-   la règle graphique locale remplace la règle de zone uniquement là où elle s'applique.
-7. Additionner la surface brute de chaque sous-surface.
-8. Ne calculer les logements que si emprise + hauteur couvrent au moins 98 % de la parcelle.
+L'intérêt est important : l'API Carto fournit les objets graphiques, mais l'archive
+peut aussi contenir les attributs supplémentaires `LIB_ATTR / LIB_VAL` publiés par
+la collectivité.
 
-## Formule
+Ces attributs sont notamment utilisés par le standard CNIG pour :
+- l'emprise maximale (38-02 / COEF_EMPRISE_SOL_MAX) ;
+- la hauteur (39-02 / HAUTEUR_METRES_MAX ou HAUTEUR_RPLUS_ETAGES) ;
+- les reculs d'implantation (15 / VALEUR DE RECUL) ;
+- le coefficient de biotope (42).
 
-Surface brute = somme(surface de chaque sous-zone × emprise applicable × niveaux applicables)
+## 2. Base de règles par zone
 
-Puis :
-- SDP = surface brute × ratio SDP
-- SHAB = SDP × ratio SHAB
-- logements = SHAB / ratio SHAB par logement
+Une seule lecture du règlement est effectuée par zone pour pré-interpréter :
+- emprise maximale ;
+- hauteur / niveaux ;
+- recul par rapport aux voies ;
+- recul aux limites latérales ;
+- recul en fond de parcelle ;
+- pleine terre / espaces verts ;
+- stationnement par logement.
 
-## Limites
+La base obtenue est affichée dans l'application et exportable en CSV.
 
-Même ce moteur ne remplace pas une étude de faisabilité complète.
-Les retraits, bandes de constructibilité, pleine terre, stationnement,
-OAP, risques et servitudes peuvent encore réduire le potentiel.
+## 3. Prescriptions graphiques supplémentaires
+
+Le moteur analyse :
+- 02 : limitations / interdictions de constructibilité ;
+- 05 : emplacements réservés ;
+- 15 : règles d'implantation / reculs ;
+- 18 : OAP ;
+- 38 : emprise ;
+- 39 : hauteur ;
+- 42 : biotope.
+
+## 4. Capacité corrigée
+
+Le calcul initial emprise × niveaux est ensuite corrigé :
+- par une enveloppe prudente liée aux reculs ;
+- par la pleine terre / le biotope ;
+- par une éventuelle interdiction graphique.
+
+Le tableau distingue :
+- logements gabarit ;
+- logements corrigés ;
+- logements retenus.
+
+## Prudence
+
+Le mode « reculs prudents » applique le plus grand recul trouvé à tout le contour
+de la parcelle faute d'identifier encore parfaitement la façade sur rue.
+Il est donc volontairement conservateur.
 
 ## Déploiement
 
@@ -50,4 +68,4 @@ Remplacer :
 - `app.py`
 - `requirements.txt`
 
-Nouvelle dépendance : `pypdf`.
+Nouvelle dépendance : `pyshp`.
