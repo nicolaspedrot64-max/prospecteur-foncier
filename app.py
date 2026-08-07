@@ -359,7 +359,9 @@ def analyse_commune(
     zones_geojson,
     include_au,
     exclude_non_residential,
-    ratio_m2_par_logement,
+    ratio_sdp_pct,
+    ratio_shab_pct,
+    shab_par_logement,
 ):
     zone_rows = []
     zone_geoms = []
@@ -442,7 +444,15 @@ def analyse_commune(
                     built_footprint += geodesic_area_m2(building_geoms[int(bi)])
 
         terrain_bati = built_count > 0
-        logements = int(max(0, math.floor(surface / max(ratio_m2_par_logement, 1))))
+
+        # Méthode de capacité définie par l'utilisateur :
+        # Surface brute -> SDP -> SHAB -> nombre de logements.
+        # À ce stade, faute de moteur de gabarit PLU complet, la surface cadastrale
+        # est utilisée comme base de "surface brute" de présélection.
+        surface_brute = float(surface)
+        sdp_estimee = surface_brute * (float(ratio_sdp_pct) / 100.0)
+        shab_estimee = sdp_estimee * (float(ratio_shab_pct) / 100.0)
+        logements = int(max(0, math.floor(shab_estimee / max(float(shab_par_logement), 1.0))))
 
         # Score de présélection, pas un score juridique.
         score = 50
@@ -470,6 +480,12 @@ def analyse_commune(
                 "section": pp["section"],
                 "numero": pp["numero"],
                 "surface_m2": round(surface),
+                "surface_brute_m2": round(surface_brute),
+                "sdp_estimee_m2": round(sdp_estimee),
+                "shab_estimee_m2": round(shab_estimee),
+                "ratio_sdp_pct": float(ratio_sdp_pct),
+                "ratio_shab_pct": float(ratio_shab_pct),
+                "shab_par_logement": float(shab_par_logement),
                 "terrain_bati": terrain_bati,
                 "nb_batiments": built_count,
                 "emprise_batie_m2": round(built_footprint),
@@ -493,6 +509,8 @@ def analyse_commune(
                 "section": pp["section"],
                 "numero": pp["numero"],
                 "surface_m2": round(surface),
+                "sdp_m2": round(sdp_estimee),
+                "shab_m2": round(shab_estimee),
                 "zone": zr["libelle"],
                 "typezone": zr["typezone"],
                 "logements": logements,
@@ -583,7 +601,7 @@ def generate_letter(row, signataire, fonction, email, ville_signature):
 # --------------------------
 st.title("🏗️ Prospecteur Foncier — V2")
 st.caption(
-    "Cadastre réel + zonage PLU/PLUi du Géoportail de l'Urbanisme + détection du bâti."
+    "Cadastre réel + PLU/PLUi + calcul de capacité SDP → SHAB → logements."
 )
 
 st.info(
@@ -629,25 +647,47 @@ with st.sidebar:
 
 st.subheader("1. Critères de recherche")
 
-c1, c2, c3, c4 = st.columns(4)
+c1, c2 = st.columns(2)
 with c1:
     min_log = st.number_input("Logements minimum", min_value=0, value=20, step=1)
 with c2:
     max_log = st.number_input("Logements maximum", min_value=0, value=50, step=1)
-with c3:
-    min_surface = st.number_input("Surface minimale (m²)", min_value=0, value=1000, step=100)
-with c4:
-    ratio_m2_par_logement = st.number_input(
-        "Hypothèse m² terrain / logement",
-        min_value=20,
-        max_value=500,
-        value=100,
-        step=10,
-        help=(
-            "Utilisée uniquement pour la présélection du nombre de logements. "
-            "Le règlement écrit du PLU n'est pas encore interprété article par article."
-        ),
+
+st.markdown("#### Ratios de calcul de capacité")
+r1, r2, r3 = st.columns(3)
+with r1:
+    ratio_sdp_pct = st.number_input(
+        "SDP / surface brute (%)",
+        min_value=1.0,
+        max_value=300.0,
+        value=80.0,
+        step=1.0,
+        help="Par défaut : SDP estimée = 80 % de la surface brute.",
     )
+with r2:
+    ratio_shab_pct = st.number_input(
+        "SHAB / SDP (%)",
+        min_value=1.0,
+        max_value=100.0,
+        value=80.0,
+        step=1.0,
+        help="Par défaut : SHAB estimée = 80 % de la SDP.",
+    )
+with r3:
+    shab_par_logement = st.number_input(
+        "SHAB moyenne / logement (m²)",
+        min_value=10.0,
+        max_value=250.0,
+        value=55.0,
+        step=1.0,
+        help="Par défaut : 55 m² SHAB par logement.",
+    )
+
+st.caption(
+    f"Calcul utilisé : SDP = surface brute × {ratio_sdp_pct:.0f} % ; "
+    f"SHAB = SDP × {ratio_shab_pct:.0f} % ; "
+    f"logements = SHAB ÷ {shab_par_logement:.0f} m²."
+)
 
 c5, c6, c7 = st.columns(3)
 with c5:
@@ -709,7 +749,9 @@ if analyse_button:
                 zones_geojson=zones_geojson,
                 include_au=(zone_mode == "Zones U + AU"),
                 exclude_non_residential=exclude_non_res,
-                ratio_m2_par_logement=ratio_m2_par_logement,
+                ratio_sdp_pct=ratio_sdp_pct,
+                ratio_shab_pct=ratio_shab_pct,
+                shab_par_logement=shab_par_logement,
             )
 
         st.session_state["analysis_results"] = results
@@ -729,8 +771,7 @@ results = st.session_state.get("analysis_results")
 if results is not None and st.session_state.get("analysis_insee") == insee:
     # Appliquer les critères courants sans relancer les appels réseau.
     filtered = results[
-        (results["surface_m2"] >= min_surface)
-        & (results["logements_estimes"] >= min_log)
+        (results["logements_estimes"] >= min_log)
         & (results["logements_estimes"] <= max_log)
     ].copy()
 
@@ -790,7 +831,9 @@ if results is not None and st.session_state.get("analysis_insee") == insee:
                 tooltip={
                     "html": (
                         "<b>{reference}</b><br/>"
-                        "Surface : {surface_m2} m²<br/>"
+                        "Surface brute : {surface_m2} m²<br/>"
+                        "SDP : {sdp_m2} m²<br/>"
+                        "SHAB : {shab_m2} m²<br/>"
                         "Zone : {typezone} {zone}<br/>"
                         "Potentiel : {logements} logements"
                     )
@@ -811,6 +854,8 @@ if results is not None and st.session_state.get("analysis_insee") == insee:
                 "section",
                 "numero",
                 "surface_m2",
+                "sdp_estimee_m2",
+                "shab_estimee_m2",
                 "terrain_bati",
                 "nb_batiments",
                 "zone_type",
@@ -834,7 +879,9 @@ if results is not None and st.session_state.get("analysis_insee") == insee:
                 "reference": st.column_config.TextColumn("Référence"),
                 "section": st.column_config.TextColumn("Section"),
                 "numero": st.column_config.TextColumn("N°"),
-                "surface_m2": st.column_config.NumberColumn("Surface m²"),
+                "surface_m2": st.column_config.NumberColumn("Surface brute m²"),
+                "sdp_estimee_m2": st.column_config.NumberColumn("SDP estimée m²"),
+                "shab_estimee_m2": st.column_config.NumberColumn("SHAB estimée m²"),
                 "terrain_bati": st.column_config.CheckboxColumn("Bâti"),
                 "nb_batiments": st.column_config.NumberColumn("Nb bâtiments"),
                 "zone_type": st.column_config.TextColumn("Type zone"),
@@ -852,6 +899,8 @@ if results is not None and st.session_state.get("analysis_insee") == insee:
                 "section",
                 "numero",
                 "surface_m2",
+                "sdp_estimee_m2",
+                "shab_estimee_m2",
                 "terrain_bati",
                 "nb_batiments",
                 "zone_type",
@@ -958,6 +1007,7 @@ with st.expander("Ce que la V2 analyse réellement"):
 - **PLU / PLUi** : zonages du Géoportail de l'Urbanisme via l'API Carto IGN.
 - **Exclusions** : zones A et N exclues ; zones U analysées ; zones AU optionnelles.
 - **Terrain nu / bâti** : déterminé par croisement spatial avec les bâtiments cadastraux.
+- **Capacité logements** : SDP = surface brute × ratio SDP ; SHAB = SDP × ratio SHAB ; logements = SHAB ÷ ratio SHAB/logement.
 - **Adresse** : recherchée pour les parcelles sélectionnées via le géocodage inverse de la Géoplateforme.
 - **Courrier** : généré à partir du modèle SAGEC fourni.
 
