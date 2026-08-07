@@ -12,6 +12,10 @@ from pathlib import Path
 import pandas as pd
 import pydeck as pdk
 import requests
+try:
+    import duckdb
+except ImportError:
+    duckdb = None
 import streamlit as st
 from docx import Document
 from pyproj import Geod
@@ -26,6 +30,13 @@ CADASTRE_BASE = "https://cadastre.data.gouv.fr/data/etalab-cadastre/latest/geojs
 CADASTRE_BASE_FALLBACK = "https://files.data.gouv.fr/cadastre/etalab-cadastre/latest/geojson/communes"
 GPU_API = "https://apicarto.ign.fr/api/gpu"
 GEOCODAGE_API = "https://data.geopf.fr/geocodage"
+
+# Fichier open data DGFiP des parcelles détenues par des personnes morales.
+# La ressource data.gouv.fr redirige vers le parquet courant.
+FPMU_PARCELLES_RESOURCE = (
+    "https://www.data.gouv.fr/api/1/datasets/r/"
+    "913b0f65-3a22-4049-beb0-c33e5084df79"
+)
 
 GEOD = Geod(ellps="WGS84")
 
@@ -62,7 +73,7 @@ REGIONS = {
 }
 
 st.set_page_config(
-    page_title="Prospecteur Foncier V3.2.2",
+    page_title="Prospecteur Foncier V3.3",
     page_icon="🏗️",
     layout="wide",
 )
@@ -73,7 +84,7 @@ st.set_page_config(
 BDNB_API = "https://api.bdnb.io/v1/bdnb/donnees/batiment_groupe_complet"
 
 HEADERS = {
-    "User-Agent": "ProspecteurFoncier/3.2.2 (Streamlit; donnees publiques)",
+    "User-Agent": "ProspecteurFoncier/3.3 (Streamlit; donnees publiques)",
     "Accept": "application/json, application/geo+json, */*",
 }
 
@@ -228,6 +239,264 @@ def detect_collective_housing(parcel_bdnb_rows):
         "usage_bdnb": " / ".join(sorted(set(usages))),
         "adresse_bdnb": adresse,
     }
+
+def _sql_ident(name):
+    return '"' + str(name).replace('"', '""') + '"'
+
+
+def _pick_column(columns, exact=(), contains_all=(), contains_any=()):
+    """
+    Trouve une colonne dans un schéma qui peut évoluer légèrement entre millésimes.
+    """
+    lower = {str(c).lower(): str(c) for c in columns}
+    for e in exact:
+        if e.lower() in lower:
+            return lower[e.lower()]
+
+    for c in columns:
+        lc = str(c).lower()
+        if contains_all and all(x.lower() in lc for x in contains_all):
+            return str(c)
+
+    for c in columns:
+        lc = str(c).lower()
+        if contains_any and any(x.lower() in lc for x in contains_any):
+            return str(c)
+
+    return None
+
+
+def _clean_owner_text(value):
+    if value is None:
+        return ""
+    txt = str(value).strip()
+    if txt.lower() in {"", "nan", "none", "null", "<na>"}:
+        return ""
+    return re.sub(r"\s+", " ", txt)
+
+
+def _canonical_parcel_id(insee, prefixe, section, numero):
+    insee = str(insee or "").strip()
+    prefixe = re.sub(r"\D", "", str(prefixe or "")).zfill(3)[-3:]
+    section = re.sub(r"[^0-9A-Za-z]", "", str(section or "")).upper().zfill(2)[-2:]
+    numero = re.sub(r"\D", "", str(numero or "")).zfill(4)[-4:]
+    return _normalise_parcelle_id(f"{insee}{prefixe}{section}{numero}")
+
+
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
+def fetch_personnes_morales_commune(insee):
+    """
+    Interroge le parquet open data des parcelles appartenant à des personnes morales.
+    Le fichier complet fait plusieurs centaines de Mo ; DuckDB ne télécharge que les
+    blocs nécessaires grâce aux requêtes HTTP Range.
+    """
+    if duckdb is None:
+        raise RuntimeError(
+            "Le module duckdb n'est pas installé. Ajoute duckdb dans requirements.txt."
+        )
+
+    con = duckdb.connect(database=":memory:")
+    try:
+        # Les versions récentes de DuckDB chargent httpfs automatiquement ; on tente
+        # explicitement le chargement puis on laisse l'auto-load prendre le relais.
+        try:
+            con.execute("LOAD httpfs")
+        except Exception:
+            try:
+                con.execute("INSTALL httpfs")
+                con.execute("LOAD httpfs")
+            except Exception:
+                pass
+
+        parquet_sql = F"read_parquet('{FPMU_PARCELLES_RESOURCE}')"
+        schema_df = con.execute(f"DESCRIBE SELECT * FROM {parquet_sql}").fetchdf()
+        columns = schema_df["column_name"].astype(str).tolist()
+
+        col_insee = _pick_column(
+            columns,
+            exact=("code_insee", "code_commune_insee", "codcomm"),
+            contains_all=("insee",),
+        )
+        col_parcelle = _pick_column(
+            columns,
+            exact=("parcelle_id", "id_parcelle", "parcelle", "idpar"),
+            contains_all=("parcelle", "id"),
+        )
+        col_prefixe = _pick_column(
+            columns,
+            exact=("prefixe", "prefixe_section", "ccopre"),
+            contains_any=("prefix", "ccopre"),
+        )
+        col_section = _pick_column(
+            columns,
+            exact=("section", "ccosec"),
+            contains_any=("section", "ccosec"),
+        )
+        col_numero = _pick_column(
+            columns,
+            exact=("numero", "numero_parcelle", "dnupla"),
+            contains_any=("numero_parcelle", "dnupla"),
+        )
+        col_denom = _pick_column(
+            columns,
+            exact=("denomination", "denomination_proprietaire", "dforme"),
+            contains_any=("denomination", "raison_sociale", "proprietaire_nom"),
+        )
+        col_forme = _pick_column(
+            columns,
+            exact=("forme_juridique", "forme_juridique_abregee", "groupe_personne"),
+            contains_any=("forme_juridique", "forme juridique", "groupe_personne"),
+        )
+        col_siren = _pick_column(
+            columns,
+            exact=("siren", "numero_siren"),
+            contains_any=("siren",),
+        )
+
+        if not col_denom:
+            raise RuntimeError(
+                "Le fichier personnes morales est accessible mais la colonne de dénomination "
+                "n'a pas pu être identifiée automatiquement."
+            )
+
+        wanted = []
+        aliases = {}
+        for alias, col in [
+            ("code_insee", col_insee),
+            ("parcelle_id", col_parcelle),
+            ("prefixe", col_prefixe),
+            ("section", col_section),
+            ("numero", col_numero),
+            ("denomination", col_denom),
+            ("forme_juridique", col_forme),
+            ("siren", col_siren),
+        ]:
+            if col:
+                wanted.append(f"{_sql_ident(col)} AS {_sql_ident(alias)}")
+                aliases[alias] = col
+
+        if not wanted:
+            return []
+
+        where = ""
+        params = []
+
+        if col_insee:
+            where = f"WHERE CAST({_sql_ident(col_insee)} AS VARCHAR) = ?"
+            params = [str(insee)]
+        elif col_parcelle:
+            # Le début de l'identifiant cadastral contient le code commune INSEE
+            # dans la représentation utilisée par les jeux cadastraux ouverts.
+            where = f"WHERE CAST({_sql_ident(col_parcelle)} AS VARCHAR) LIKE ?"
+            params = [f"{insee}%"]
+
+        query = f"SELECT {', '.join(wanted)} FROM {parquet_sql} {where}"
+        df = con.execute(query, params).fetchdf()
+        return df.to_dict("records")
+    finally:
+        con.close()
+
+
+def build_personnes_morales_index(insee, rows):
+    """
+    Indexe les propriétaires personnes morales par identifiant cadastral normalisé.
+    Plusieurs propriétaires sont concaténés lorsqu'ils existent.
+    """
+    temp = {}
+
+    for r in rows or []:
+        pid = _normalise_parcelle_id(r.get("parcelle_id"))
+        if not pid:
+            pid = _canonical_parcel_id(
+                insee,
+                r.get("prefixe"),
+                r.get("section"),
+                r.get("numero"),
+            )
+        if not pid:
+            continue
+
+        denom = _clean_owner_text(r.get("denomination"))
+        forme = _clean_owner_text(r.get("forme_juridique"))
+        siren = _clean_owner_text(r.get("siren"))
+
+        if not denom:
+            continue
+
+        key = (denom, forme, siren)
+        temp.setdefault(pid, set()).add(key)
+
+    index = {}
+    for pid, owners in temp.items():
+        owners = sorted(owners)
+        names = [o[0] for o in owners if o[0]]
+        formes = [o[1] for o in owners if o[1]]
+        sirens = [o[2] for o in owners if o[2]]
+
+        joined_name = " / ".join(dict.fromkeys(names))
+        joined_forme = " / ".join(dict.fromkeys(formes))
+        joined_siren = " / ".join(dict.fromkeys(sirens))
+
+        upper = normalize_text(joined_name + " " + joined_forme)
+        is_commune = any(
+            token in upper
+            for token in [
+                "commune de ",
+                "commune d ",
+                "mairie",
+                "ville de ",
+                "commune",
+            ]
+        )
+
+        index[pid] = {
+            "proprietaire_personne_morale": joined_name,
+            "forme_juridique_proprietaire": joined_forme,
+            "siren_proprietaire": joined_siren,
+            "proprietaire_commune": is_commune,
+            "proprietaire_type": "Commune / collectivité" if is_commune else "Société / personne morale",
+        }
+
+    return index
+
+
+def enrich_with_personnes_morales(df, insee, owner_index):
+    if df is None:
+        return df
+
+    df = df.copy()
+    defaults = {
+        "proprietaire_personne_morale": "",
+        "forme_juridique_proprietaire": "",
+        "siren_proprietaire": "",
+        "proprietaire_type": "",
+        "proprietaire_commune": False,
+    }
+    for c, default in defaults.items():
+        if c not in df.columns:
+            df[c] = default
+
+    if df.empty:
+        return df
+
+    for idx, row in df.iterrows():
+        pid = _normalise_parcelle_id(row.get("reference"))
+        info = owner_index.get(pid)
+        if not info:
+            # Fallback : reconstruire un identifiant à partir des champs cadastraux.
+            pid2 = _canonical_parcel_id(
+                insee,
+                "",
+                row.get("section"),
+                row.get("numero"),
+            )
+            info = owner_index.get(pid2)
+
+        if info:
+            for k, v in info.items():
+                df.at[idx, k] = v
+
+    return df
 
 def gpu_get(layer, params, timeout=90):
     url = f"{GPU_API}/{layer}"
@@ -1016,6 +1285,11 @@ def analyse_commune(
         "latitude",
         "longitude",
         "adresse",
+        "proprietaire_personne_morale",
+        "forme_juridique_proprietaire",
+        "siren_proprietaire",
+        "proprietaire_type",
+        "proprietaire_commune",
     ]
     df = pd.DataFrame(rows)
     if df.empty:
@@ -1107,9 +1381,9 @@ def generate_letter(row, signataire, fonction, email, ville_signature):
 # --------------------------
 # Interface
 # --------------------------
-st.title("🏗️ Prospecteur Foncier — V3.2.2 — Habitat hors secteurs économiques")
+st.title("🏗️ Prospecteur Foncier — V3.3 — Prospection foncière")
 st.caption(
-    "Cadastre réel + PLU/PLUi + filtre Habitat renforcé + exclusion des secteurs à vocation économique + calcul SDP/SHAB."
+    "Cadastre réel + PLU/PLUi + exclusion des secteurs économiques + propriétaires personnes morales + calcul SDP/SHAB."
 )
 
 st.info(
@@ -1197,7 +1471,7 @@ st.caption(
     f"logements = SHAB ÷ {shab_par_logement:.0f} m²."
 )
 
-c5, c6, c7 = st.columns(3)
+c5, c6 = st.columns(2)
 with c5:
     zone_mode = st.selectbox(
         "Zones à analyser",
@@ -1212,31 +1486,11 @@ with c6:
         "Terrain",
         ["Indifférent", "Terrain nu", "Terrain bâti"],
     )
-with c7:
-    habitat_only = st.checkbox(
-        "Conserver uniquement les parcelles destinées à l'habitat",
-        value=True,
-        help=(
-            "Filtre haute précision utilisant les destinations CNIG du PLU/PLUi, "
-            "l'ancienne vocation dominante et les libellés de zone."
-        ),
-    )
 
-h1, h2 = st.columns(2)
-with h1:
-    include_conditionnel = st.checkbox(
-        "Inclure l'habitat autorisé sous conditions",
-        value=True,
-        help=(
-            "Conserve les zones dont le standard CNIG indique Habitation/Logement "
-            "dans DESTCDT (destination autorisée sous conditions)."
-        ),
-    )
-with h2:
-    st.info(
-        "Mode strict : si le PLU ne fournit pas de preuve suffisamment explicite que le logement "
-        "est autorisé, la zone est écartée."
-    )
+# Le filtre Habitat strict est supprimé à la demande.
+# Les secteurs à vocation économique restent en revanche systématiquement exclus.
+habitat_only = False
+include_conditionnel = True
 
 st.caption(
     "Filtre économique actif : les zones dont la vocation dominante est l'activité économique "
@@ -1306,6 +1560,32 @@ if analyse_button:
                 shab_par_logement=shab_par_logement,
             )
 
+        with st.spinner("Recherche des propriétaires personnes morales (sociétés / communes)…"):
+            try:
+                pm_rows = fetch_personnes_morales_commune(insee)
+                pm_index = build_personnes_morales_index(insee, pm_rows)
+                results = enrich_with_personnes_morales(results, insee, pm_index)
+
+                if feature_map and not results.empty:
+                    owner_by_ref = results.set_index("reference")[
+                        ["proprietaire_personne_morale", "proprietaire_type"]
+                    ].to_dict("index")
+                    for ref, feat in feature_map.items():
+                        owner = owner_by_ref.get(ref, {})
+                        feat.setdefault("properties", {})["proprietaire"] = (
+                            owner.get("proprietaire_personne_morale") or "Non identifié (personne morale)"
+                        )
+                        feat["properties"]["type_proprietaire"] = owner.get("proprietaire_type") or ""
+
+                st.session_state["owner_error"] = ""
+            except Exception as owner_exc:
+                results = enrich_with_personnes_morales(results, insee, {})
+                if feature_map:
+                    for _, feat in feature_map.items():
+                        feat.setdefault("properties", {})["proprietaire"] = "Non disponible"
+                        feat["properties"]["type_proprietaire"] = ""
+                st.session_state["owner_error"] = str(owner_exc)
+
         st.session_state["analysis_results"] = results
         st.session_state["feature_map"] = feature_map
         st.session_state["analysis_insee"] = insee
@@ -1321,18 +1601,11 @@ if analyse_button:
 
 results = st.session_state.get("analysis_results")
 if results is not None and st.session_state.get("analysis_insee") == insee:
-    # Si le filtre Habitat n'a trouvé aucune parcelle, ne pas laisser Pandas provoquer un KeyError.
     if results.empty or "logements_estimes" not in results.columns:
         st.subheader("2. Résultats sur le cadastre réel")
         st.warning(
-            "Aucune parcelle n'a été retenue avec le filtre Habitat actuel pour cette commune. "
-            "Ce n'est plus une erreur de l'application : cela signifie soit que les métadonnées du PLU "
-            "ne permettent pas d'identifier explicitement la destination logement, soit que le filtre est trop strict."
-        )
-        st.info(
-            "Essaie d'abord de décocher « Conserver uniquement les parcelles destinées à l'habitat » "
-            "pour vérifier que le cadastre et le zonage sont bien chargés. "
-            "Ensuite nous pourrons adapter le moteur Habitat à la structure du PLU de cette commune."
+            "Aucune parcelle n'a été retenue pour cette commune avec les règles actuelles "
+            "(zones U/AUc, exclusion des secteurs économiques et du collectif existant)."
         )
         st.stop()
 
@@ -1345,10 +1618,6 @@ if results is not None and st.session_state.get("analysis_insee") == insee:
     # Sécurité supplémentaire : les secteurs à vocation économique sont toujours exclus.
     if "economic_vocation" in filtered.columns:
         filtered = filtered[filtered["economic_vocation"] == False].copy()
-
-    # Filtre Habitat haute précision.
-    if habitat_only:
-        filtered = filtered[filtered["habitat_eligible"] == True].copy()
 
     # Règle métier : on élimine les parcelles sur lesquelles
     # la BDNB identifie déjà du logement collectif.
@@ -1385,6 +1654,13 @@ if results is not None and st.session_state.get("analysis_insee") == insee:
             "La BDNB n'a pas répondu pendant cette analyse. Dans ce cas, le logiciel ne peut pas "
             "garantir l'exclusion des résidences collectives. Détail : "
             + st.session_state["bdnb_error"]
+        )
+
+    if st.session_state.get("owner_error"):
+        st.warning(
+            "La recherche des propriétaires personnes morales n'a pas pu être chargée. "
+            "Les parcelles restent analysées normalement, mais le nom du propriétaire société/commune "
+            "peut être vide. Détail : " + st.session_state["owner_error"]
         )
 
     if filtered.empty:
@@ -1429,6 +1705,8 @@ if results is not None and st.session_state.get("analysis_insee") == insee:
                         "Habitat : {habitat}<br/>"
                         "Confiance habitat : {confiance_habitat} %<br/>"
                         "Collectif existant : {collectif}<br/>"
+                        "Propriétaire PM : {proprietaire}<br/>"
+                        "Type propriétaire : {type_proprietaire}<br/>"
                         "Zone : {typezone} {zone}<br/>"
                         "Potentiel : {logements} logements"
                     )
@@ -1448,6 +1726,10 @@ if results is not None and st.session_state.get("analysis_insee") == insee:
                 "reference",
                 "section",
                 "numero",
+                "proprietaire_personne_morale",
+                "proprietaire_type",
+                "forme_juridique_proprietaire",
+                "siren_proprietaire",
                 "surface_m2",
                 "sdp_estimee_m2",
                 "shab_estimee_m2",
@@ -1481,6 +1763,10 @@ if results is not None and st.session_state.get("analysis_insee") == insee:
                 "reference": st.column_config.TextColumn("Référence"),
                 "section": st.column_config.TextColumn("Section"),
                 "numero": st.column_config.TextColumn("N°"),
+                "proprietaire_personne_morale": st.column_config.TextColumn("Propriétaire société / commune"),
+                "proprietaire_type": st.column_config.TextColumn("Type propriétaire"),
+                "forme_juridique_proprietaire": st.column_config.TextColumn("Forme juridique"),
+                "siren_proprietaire": st.column_config.TextColumn("SIREN"),
                 "surface_m2": st.column_config.NumberColumn("Surface brute m²"),
                 "sdp_estimee_m2": st.column_config.NumberColumn("SDP estimée m²"),
                 "shab_estimee_m2": st.column_config.NumberColumn("SHAB estimée m²"),
@@ -1509,6 +1795,10 @@ if results is not None and st.session_state.get("analysis_insee") == insee:
                 "reference",
                 "section",
                 "numero",
+                "proprietaire_personne_morale",
+                "proprietaire_type",
+                "forme_juridique_proprietaire",
+                "siren_proprietaire",
                 "surface_m2",
                 "sdp_estimee_m2",
                 "shab_estimee_m2",
@@ -1628,7 +1918,8 @@ with st.expander("Ce que la V2 analyse réellement"):
 - **Cadastre** : parcelles et bâtiments réels du dernier millésime Etalab.
 - **PLU / PLUi** : zonages du Géoportail de l'Urbanisme via l'API Carto IGN.
 - **Exclusion économique prioritaire** : `DESTDOMI=02`, `FORMDOMI=0200/0201/0202/0203` et libellés explicites d'activités économiques sont éliminés.
-- **Filtre Habitat structuré** : lecture des champs CNIG `DESTOUI`, `DESTCDT`, `DESTNON` ; les codes 20/21 correspondent à Habitation/Logement.
+- **Filtre “uniquement habitat” supprimé** : les autres zones U/AUc restent analysées dès lors qu'elles ne sont pas identifiées comme secteurs économiques.
+- **Propriétaires personnes morales** : tentative de rapprochement avec le fichier open data DGFiP des parcelles détenues par des personnes morales ; affichage du nom, de la forme juridique et du SIREN lorsqu'ils sont disponibles.
 - **Compatibilité anciens PLU** : lecture de `DESTDOMI` (01 habitat ; 03 mixte habitat/activité) puis analyse des libellés explicites.
 - **Exclusions de zonage** : A, N et AUs sont écartées ; U et AUc sont analysées selon la destination logement.
 - **Mode haute précision** : une zone ambiguë sans preuve explicite d'habitat est exclue.

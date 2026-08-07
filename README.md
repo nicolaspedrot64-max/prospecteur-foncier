@@ -1,31 +1,31 @@
-# Prospecteur Foncier V3.2.2 — Habitat hors secteurs économiques
+# Prospecteur Foncier V3.3 — propriétaires personnes morales
 
-Cette version conserve le moteur Habitat de la V3.2.1 et ajoute une exclusion prioritaire
-des secteurs à vocation d'activités économiques.
+## Changements
 
-## Exclusion économique
+1. Le filtre visible « Conserver uniquement les parcelles destinées à l'habitat » est supprimé.
+2. L'exclusion des secteurs à vocation d'activités économiques reste active.
+3. Le logiciel tente maintenant d'identifier le propriétaire lorsqu'il s'agit d'une
+   **personne morale** : société, SCI, collectivité, commune, etc.
+4. Le tableau affiche :
+   - nom / dénomination ;
+   - type de propriétaire ;
+   - forme juridique ;
+   - SIREN lorsqu'il est fourni par la source.
 
-Une zone est rejetée avant toute autre analyse lorsque l'une des preuves suivantes est présente :
+## Source propriétaires
 
-- ancien standard CNIG : `DESTDOMI=02` (activité) ;
-- standard CNIG récent :
-  - `FORMDOMI=0200` activité ;
-  - `FORMDOMI=0201` activité industrielle / logistique / commerciale ;
-  - `FORMDOMI=0202` activité commerces ;
-  - `FORMDOMI=0203` activité bureaux ;
-- libellé explicite indiquant notamment zone/secteur/parc d'activités, vocation économique,
-  industrie, artisanat, commerce, logistique, tertiaire ou pôle économique.
+Le rapprochement utilise le jeu open data DGFiP « Fichiers des locaux et des parcelles
+des personnes morales », via la version unifiée au format Parquet publiée sur data.gouv.fr.
 
-Les secteurs mixtes habitat/activité (`DESTDOMI=03` / `FORMDOMI=0300`) ne sont pas exclus
-par ce filtre économique : ils restent soumis au filtre Habitat.
+Les propriétaires personnes physiques ne sont volontairement pas identifiés : si aucune
+personne morale n'est trouvée, le champ reste vide.
 
-## Autres règles conservées
+## Important pour le déploiement
 
-- filtre Habitat strict ;
-- calcul SDP / SHAB / logements ;
-- exclusion du résidentiel collectif existant via la BDNB ;
-- cadastre réel, carte, adresses et lettres.
+Cette version ajoute la dépendance `duckdb`.
 
-## Déploiement
+Sur GitHub, remplacez donc :
+- `app.py`
+- `requirements.txt`
 
-Remplacer uniquement `app.py` sur GitHub.
+Puis faites Commit changes. Streamlit redéploiera automatiquement l'application.
