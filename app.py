@@ -62,7 +62,7 @@ REGIONS = {
 }
 
 st.set_page_config(
-    page_title="Prospecteur Foncier V3.2",
+    page_title="Prospecteur Foncier V3.2.1",
     page_icon="🏗️",
     layout="wide",
 )
@@ -73,7 +73,7 @@ st.set_page_config(
 BDNB_API = "https://api.bdnb.io/v1/bdnb/donnees/batiment_groupe_complet"
 
 HEADERS = {
-    "User-Agent": "ProspecteurFoncier/3.2 (Streamlit; donnees publiques)",
+    "User-Agent": "ProspecteurFoncier/3.2.1 (Streamlit; donnees publiques)",
     "Accept": "application/json, application/geo+json, */*",
 }
 
@@ -876,7 +876,55 @@ def analyse_commune(
             "geometry": mapping(pg),
         }
 
-    return pd.DataFrame(rows), feature_map
+    expected_columns = [
+        "selection",
+        "ville",
+        "code_insee",
+        "reference",
+        "section",
+        "numero",
+        "surface_m2",
+        "surface_brute_m2",
+        "sdp_estimee_m2",
+        "shab_estimee_m2",
+        "ratio_sdp_pct",
+        "ratio_shab_pct",
+        "shab_par_logement",
+        "terrain_bati",
+        "nb_batiments",
+        "emprise_batie_m2",
+        "collectif_existant",
+        "usage_bdnb",
+        "zone_type",
+        "zone_plu",
+        "zone_description",
+        "classe_zone",
+        "habitat_eligible",
+        "habitat_statut",
+        "habitat_preuve",
+        "habitat_confiance",
+        "destoui",
+        "destcdt",
+        "destnon",
+        "destdomi",
+        "reglement_url",
+        "date_zone",
+        "logements_estimes",
+        "score",
+        "latitude",
+        "longitude",
+        "adresse",
+    ]
+    df = pd.DataFrame(rows)
+    if df.empty:
+        df = pd.DataFrame(columns=expected_columns)
+    else:
+        for col in expected_columns:
+            if col not in df.columns:
+                df[col] = None
+        df = df[expected_columns]
+
+    return df, feature_map
 
 
 # --------------------------
@@ -957,7 +1005,7 @@ def generate_letter(row, signataire, fonction, email, ville_signature):
 # --------------------------
 # Interface
 # --------------------------
-st.title("🏗️ Prospecteur Foncier — V3.2 — Filtre Habitat")
+st.title("🏗️ Prospecteur Foncier — V3.2.1 — Filtre Habitat")
 st.caption(
     "Cadastre réel + PLU/PLUi + filtre Habitat renforcé + calcul SDP/SHAB + exclusion du collectif existant."
 )
@@ -1165,6 +1213,21 @@ if analyse_button:
 
 results = st.session_state.get("analysis_results")
 if results is not None and st.session_state.get("analysis_insee") == insee:
+    # Si le filtre Habitat n'a trouvé aucune parcelle, ne pas laisser Pandas provoquer un KeyError.
+    if results.empty or "logements_estimes" not in results.columns:
+        st.subheader("2. Résultats sur le cadastre réel")
+        st.warning(
+            "Aucune parcelle n'a été retenue avec le filtre Habitat actuel pour cette commune. "
+            "Ce n'est plus une erreur de l'application : cela signifie soit que les métadonnées du PLU "
+            "ne permettent pas d'identifier explicitement la destination logement, soit que le filtre est trop strict."
+        )
+        st.info(
+            "Essaie d'abord de décocher « Conserver uniquement les parcelles destinées à l'habitat » "
+            "pour vérifier que le cadastre et le zonage sont bien chargés. "
+            "Ensuite nous pourrons adapter le moteur Habitat à la structure du PLU de cette commune."
+        )
+        st.stop()
+
     # Appliquer les critères courants sans relancer les appels réseau.
     filtered = results[
         (results["logements_estimes"] >= min_log)
@@ -1190,6 +1253,12 @@ if results is not None and st.session_state.get("analysis_insee") == insee:
     ).reset_index(drop=True)
 
     st.subheader("2. Résultats sur le cadastre réel")
+
+    if filtered.empty:
+        st.warning(
+            "Le cadastre et le PLU ont bien été analysés, mais aucune parcelle ne correspond "
+            "à l'ensemble des critères actuels (habitat, nombre de logements, type de terrain, collectif existant, etc.)."
+        )
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Parcelles retenues", len(filtered))
     m2.metric("Parcelles analysées", len(results))
