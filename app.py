@@ -18,6 +18,21 @@ except ImportError:
     duckdb = None
 import streamlit as st
 from docx import Document
+from reportlab.lib import colors
+from reportlab.lib.enums import TA_CENTER, TA_LEFT
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import mm
+from reportlab.lib.utils import ImageReader
+from reportlab.platypus import (
+    SimpleDocTemplate,
+    Paragraph,
+    Spacer,
+    Table,
+    TableStyle,
+    PageBreak,
+    Flowable,
+)
 from pyproj import Geod
 from shapely.geometry import shape, mapping
 from shapely.strtree import STRtree
@@ -86,7 +101,7 @@ REGIONS = {
 }
 
 st.set_page_config(
-    page_title="Prospecteur Foncier V3.7.3",
+    page_title="Prospecteur Foncier V3.7.4",
     page_icon="🏗️",
     layout="wide",
 )
@@ -97,7 +112,7 @@ st.set_page_config(
 BDNB_API = "https://api.bdnb.io/v1/bdnb/donnees/batiment_groupe_complet"
 
 HEADERS = {
-    "User-Agent": "ProspecteurFoncier/3.7.3 (Streamlit; donnees publiques)",
+    "User-Agent": "ProspecteurFoncier/3.7.4 (Streamlit; donnees publiques)",
     "Accept": "application/json, application/geo+json, */*",
 }
 
@@ -1985,16 +2000,22 @@ def analyse_commune(
 
 
 # --------------------------
-# Courriers
+# Courriers + dossier PDF
 # --------------------------
 def replace_text_in_runs(paragraph, replacements):
+    """
+    Remplacement robuste tout en conservant la mise en forme du premier run.
+    Les placeholders du modèle peuvent être découpés sur plusieurs runs Word.
+    """
     full = "".join(run.text for run in paragraph.runs)
     if not full:
         return
+
     new = full
     for old, repl in replacements.items():
         if old in new:
-            new = new.replace(old, repl)
+            new = new.replace(old, str(repl))
+
     if new != full:
         if paragraph.runs:
             paragraph.runs[0].text = new
@@ -2004,7 +2025,28 @@ def replace_text_in_runs(paragraph, replacements):
             paragraph.text = new
 
 
+def _apply_docx_replacements(doc, replacements):
+    for p in doc.paragraphs:
+        replace_text_in_runs(p, replacements)
+
+    for table in doc.tables:
+        for row_ in table.rows:
+            for cell in row_.cells:
+                for p in cell.paragraphs:
+                    replace_text_in_runs(p, replacements)
+
+    for section in doc.sections:
+        for p in section.header.paragraphs:
+            replace_text_in_runs(p, replacements)
+        for p in section.footer.paragraphs:
+            replace_text_in_runs(p, replacements)
+
+
 def generate_letter(row, signataire, fonction, email, ville_signature):
+    """
+    Génère la lettre à partir du nouveau modèle SAGEC fourni par l'utilisateur.
+    Le texte du modèle est conservé ; seuls les champs variables sont remplacés.
+    """
     if not LETTER_TEMPLATE.exists():
         raise FileNotFoundError(
             "Le fichier lettre_sagec_modele.docx doit être présent à côté de app.py."
@@ -2014,44 +2056,34 @@ def generate_letter(row, signataire, fonction, email, ville_signature):
 
     adresse = str(row.get("adresse") or "").strip()
     if not adresse:
-        adresse = f"Parcelle section {row['section']} n° {row['numero']}, {row['ville']}"
+        adresse = (
+            f"Parcelle section {row.get('section', '')} "
+            f"n° {row.get('numero', '')}, {row.get('ville', '')}"
+        )
 
-    ville = str(row["ville"]).strip()
-    section = str(row["section"]).strip()
-    numero = str(row["numero"]).strip()
+    ville = str(row.get("ville") or "").strip()
+    section = str(row.get("section") or "").strip()
+    numero = str(row.get("numero") or "").strip()
 
     replacements = {
-        "Adresse….": adresse,
-        "Adresse...": adresse,
-        "Ville……": ville,
-        "Ville......": ville,
-        "Anglet, le 19/05/2026.": f"{ville_signature}, le {date.today().strftime('%d/%m/%Y')}.",
-        "Objet : Votre propriété à …………….": f"Objet : Votre propriété à {adresse}",
-        "votre propriété située à ………": f"votre propriété située à {adresse}",
-        "cadastrée section………………………,": f"cadastrée section {section} n° {numero},",
+        "(Adresse)": adresse,
+        "(Ville)": ville,
+        "Anglet, le ../../2026.": (
+            f"{ville_signature}, le {date.today().strftime('%d/%m/%Y')}."
+        ),
+        "Objet : Votre propriété située à …………….": (
+            f"Objet : Votre propriété située à {adresse}"
+        ),
+        "votre propriété située à ………, cadastrée section ………………………,": (
+            f"votre propriété située à {adresse}, "
+            f"cadastrée section {section} n° {numero},"
+        ),
         "Nicolas PEDROT": signataire,
         "Directeur": fonction,
         "Nicolas.pedrot@sagec.fr": email,
     }
 
-    for p in doc.paragraphs:
-        replace_text_in_runs(p, replacements)
-    for table in doc.tables:
-        for row_ in table.rows:
-            for cell in row_.cells:
-                for p in cell.paragraphs:
-                    replace_text_in_runs(p, replacements)
-
-    for p in doc.paragraphs:
-        t = p.text
-        if "Objet : Votre propriété à" in t and adresse not in t:
-            p.text = f"Objet : Votre propriété à {adresse}"
-        if "Dans le cadre de nos recherches foncières" in t:
-            p.text = (
-                f"Dans le cadre de nos recherches foncières, nous avons identifié que votre propriété "
-                f"située à {adresse}, cadastrée section {section} n° {numero}, comme pouvant présenter "
-                f"un fort potentiel pour le développement d'une opération immobilière."
-            )
+    _apply_docx_replacements(doc, replacements)
 
     out = io.BytesIO()
     doc.save(out)
@@ -2059,12 +2091,646 @@ def generate_letter(row, signataire, fonction, email, ville_signature):
     return out
 
 
+def _pdf_escape(value):
+    txt = str(value if value not in [None, ""] else "—")
+    return (
+        txt.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+
+def _pdf_number(value, digits=0, suffix=""):
+    try:
+        if value is None or pd.isna(value):
+            return "—"
+        num = float(value)
+        if digits == 0:
+            text = f"{num:,.0f}".replace(",", " ")
+        else:
+            text = f"{num:,.{digits}f}".replace(",", " ").replace(".", ",")
+        return f"{text}{suffix}"
+    except Exception:
+        return "—"
+
+
+def _logo_bytes_from_template():
+    """
+    Réutilise directement le logo contenu dans le modèle Word SAGEC :
+    aucun fichier logo supplémentaire n'est nécessaire sur GitHub.
+    """
+    if not LETTER_TEMPLATE.exists():
+        return None
+    try:
+        with zipfile.ZipFile(LETTER_TEMPLATE, "r") as z:
+            media = [
+                n for n in z.namelist()
+                if n.lower().startswith("word/media/")
+                and n.lower().endswith((".png", ".jpg", ".jpeg"))
+            ]
+            if not media:
+                return None
+            media.sort(key=lambda n: len(z.read(n)), reverse=True)
+            return z.read(media[0])
+    except Exception:
+        return None
+
+
+class ParcelSketch(Flowable):
+    """
+    Petit plan vectoriel de la parcelle, dessiné directement depuis la géométrie cadastrale.
+    """
+    def __init__(self, feature, width=78 * mm, height=50 * mm):
+        Flowable.__init__(self)
+        self.feature = feature
+        self.width = width
+        self.height = height
+
+    def draw(self):
+        c = self.canv
+        c.saveState()
+
+        c.setStrokeColor(colors.HexColor("#D3DCE6"))
+        c.setFillColor(colors.HexColor("#F7F9FB"))
+        c.roundRect(0, 0, self.width, self.height, 4 * mm, fill=1, stroke=1)
+
+        if not self.feature or not self.feature.get("geometry"):
+            c.setFillColor(colors.HexColor("#7A8793"))
+            c.setFont("Helvetica", 8)
+            c.drawCentredString(
+                self.width / 2,
+                self.height / 2,
+                "Géométrie cadastrale indisponible",
+            )
+            c.restoreState()
+            return
+
+        try:
+            geom = shape(self.feature["geometry"])
+            polygons = []
+            if geom.geom_type == "Polygon":
+                polygons = [geom]
+            elif geom.geom_type == "MultiPolygon":
+                polygons = list(geom.geoms)
+
+            if not polygons:
+                raise ValueError("géométrie non surfacique")
+
+            minx, miny, maxx, maxy = geom.bounds
+            dx = max(maxx - minx, 1e-9)
+            dy = max(maxy - miny, 1e-9)
+
+            pad = 5 * mm
+            avail_w = self.width - 2 * pad
+            avail_h = self.height - 2 * pad
+            scale = min(avail_w / dx, avail_h / dy)
+
+            offset_x = pad + (avail_w - dx * scale) / 2
+            offset_y = pad + (avail_h - dy * scale) / 2
+
+            c.setFillColor(colors.HexColor("#DCECF7"))
+            c.setStrokeColor(colors.HexColor("#1766A5"))
+            c.setLineWidth(1.4)
+
+            for poly in polygons:
+                coords = list(poly.exterior.coords)
+                path = c.beginPath()
+                for j, (x, y) in enumerate(coords):
+                    px = offset_x + (x - minx) * scale
+                    py = offset_y + (y - miny) * scale
+                    if j == 0:
+                        path.moveTo(px, py)
+                    else:
+                        path.lineTo(px, py)
+                path.close()
+                c.drawPath(path, fill=1, stroke=1)
+
+                # Les trous cadastraux éventuels sont matérialisés en blanc.
+                for ring in poly.interiors:
+                    icoords = list(ring.coords)
+                    ipath = c.beginPath()
+                    for j, (x, y) in enumerate(icoords):
+                        px = offset_x + (x - minx) * scale
+                        py = offset_y + (y - miny) * scale
+                        if j == 0:
+                            ipath.moveTo(px, py)
+                        else:
+                            ipath.lineTo(px, py)
+                    ipath.close()
+                    c.setFillColor(colors.white)
+                    c.drawPath(ipath, fill=1, stroke=1)
+                    c.setFillColor(colors.HexColor("#DCECF7"))
+
+            c.setFillColor(colors.HexColor("#5B6770"))
+            c.setFont("Helvetica", 7)
+            c.drawString(4 * mm, 2.5 * mm, "Emprise cadastrale - schéma non contractuel")
+
+        except Exception:
+            c.setFillColor(colors.HexColor("#7A8793"))
+            c.setFont("Helvetica", 8)
+            c.drawCentredString(
+                self.width / 2,
+                self.height / 2,
+                "Aperçu parcellaire indisponible",
+            )
+
+        c.restoreState()
+
+
+def generate_selected_parcels_pdf(selected_df, commune_name, insee, feature_map):
+    """
+    Génère un dossier PDF de prospection :
+    - page de synthèse ;
+    - tableau récapitulatif ;
+    - une fiche détaillée par parcelle avec schéma cadastral.
+    """
+    buffer = io.BytesIO()
+    page_w, page_h = A4
+
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=A4,
+        rightMargin=15 * mm,
+        leftMargin=15 * mm,
+        topMargin=31 * mm,
+        bottomMargin=18 * mm,
+        title=f"Sélection foncière - {commune_name}",
+        author="SAGEC SUD ATLANTIQUE",
+    )
+
+    styles = getSampleStyleSheet()
+    sagec_blue = colors.HexColor("#1766A5")
+    dark = colors.HexColor("#263746")
+    muted = colors.HexColor("#657786")
+    light_blue = colors.HexColor("#EEF5FA")
+    line = colors.HexColor("#D8E1E8")
+
+    title_style = ParagraphStyle(
+        "SagecTitle",
+        parent=styles["Title"],
+        fontName="Helvetica-Bold",
+        fontSize=20,
+        leading=23,
+        textColor=sagec_blue,
+        spaceAfter=5 * mm,
+    )
+    subtitle_style = ParagraphStyle(
+        "SagecSubtitle",
+        parent=styles["Normal"],
+        fontName="Helvetica",
+        fontSize=10,
+        leading=14,
+        textColor=muted,
+        spaceAfter=5 * mm,
+    )
+    h2 = ParagraphStyle(
+        "SagecH2",
+        parent=styles["Heading2"],
+        fontName="Helvetica-Bold",
+        fontSize=13,
+        leading=16,
+        textColor=dark,
+        spaceBefore=2 * mm,
+        spaceAfter=3 * mm,
+    )
+    body = ParagraphStyle(
+        "SagecBody",
+        parent=styles["BodyText"],
+        fontName="Helvetica",
+        fontSize=8.5,
+        leading=11,
+        textColor=dark,
+    )
+    small = ParagraphStyle(
+        "SagecSmall",
+        parent=body,
+        fontSize=7.3,
+        leading=9,
+        textColor=muted,
+    )
+    metric_label = ParagraphStyle(
+        "MetricLabel",
+        parent=body,
+        fontSize=7,
+        leading=8,
+        textColor=muted,
+        alignment=TA_CENTER,
+    )
+    metric_value = ParagraphStyle(
+        "MetricValue",
+        parent=body,
+        fontName="Helvetica-Bold",
+        fontSize=14,
+        leading=16,
+        textColor=sagec_blue,
+        alignment=TA_CENTER,
+    )
+
+    logo_bytes = _logo_bytes_from_template()
+    logo_reader = None
+    if logo_bytes:
+        try:
+            logo_reader = ImageReader(io.BytesIO(logo_bytes))
+        except Exception:
+            logo_reader = None
+
+    def on_page(canvas, pdf_doc):
+        canvas.saveState()
+
+        # En-tête
+        if logo_reader:
+            try:
+                iw, ih = logo_reader.getSize()
+                max_w = 38 * mm
+                max_h = 18 * mm
+                ratio = min(max_w / iw, max_h / ih)
+                canvas.drawImage(
+                    logo_reader,
+                    15 * mm,
+                    page_h - 24 * mm,
+                    width=iw * ratio,
+                    height=ih * ratio,
+                    mask="auto",
+                )
+            except Exception:
+                pass
+
+        canvas.setStrokeColor(line)
+        canvas.setLineWidth(0.6)
+        canvas.line(15 * mm, page_h - 27 * mm, page_w - 15 * mm, page_h - 27 * mm)
+
+        # Pied de page
+        canvas.setStrokeColor(line)
+        canvas.line(15 * mm, 13 * mm, page_w - 15 * mm, 13 * mm)
+        canvas.setFillColor(muted)
+        canvas.setFont("Helvetica", 7)
+        canvas.drawString(
+            15 * mm,
+            8 * mm,
+            "SAGEC SUD ATLANTIQUE - Préselection foncière - Données indicatives",
+        )
+        canvas.drawRightString(
+            page_w - 15 * mm,
+            8 * mm,
+            f"Page {pdf_doc.page}",
+        )
+        canvas.restoreState()
+
+    rows = selected_df.copy()
+    if "reference" in rows.columns:
+        rows = rows.drop_duplicates(subset=["reference"]).reset_index(drop=True)
+
+    story = []
+
+    # --------------------------------------------------------------
+    # Couverture / synthèse
+    # --------------------------------------------------------------
+    story.append(Paragraph("Sélection foncière", title_style))
+    story.append(
+        Paragraph(
+            f"<b>{_pdf_escape(commune_name)}</b> - Code INSEE {_pdf_escape(insee)}"
+            f"<br/>Dossier généré le {date.today().strftime('%d/%m/%Y')}",
+            subtitle_style,
+        )
+    )
+
+    total_surface = pd.to_numeric(rows.get("surface_m2"), errors="coerce").fillna(0).sum()
+    total_log = pd.to_numeric(rows.get("logements_plu"), errors="coerce").fillna(0).sum()
+    total_sdp = pd.to_numeric(rows.get("sdp_plu_m2"), errors="coerce").fillna(0).sum()
+
+    ptz_values = []
+    if "zone_ptz" in rows.columns:
+        ptz_values = [
+            str(x) for x in rows["zone_ptz"].dropna().unique().tolist() if str(x).strip()
+        ]
+    ptz_text = ", ".join(ptz_values) if ptz_values else "—"
+
+    metrics = [
+        (
+            Paragraph(str(len(rows)), metric_value),
+            Paragraph("parcelles sélectionnées", metric_label),
+        ),
+        (
+            Paragraph(_pdf_number(total_surface, 0, " m²"), metric_value),
+            Paragraph("surface cadastrale cumulée", metric_label),
+        ),
+        (
+            Paragraph(_pdf_number(total_sdp, 0, " m²"), metric_value),
+            Paragraph("SDP estimée cumulée", metric_label),
+        ),
+        (
+            Paragraph(_pdf_number(total_log, 0), metric_value),
+            Paragraph("logements estimés cumulés", metric_label),
+        ),
+    ]
+
+    metric_cells = []
+    for value, label in metrics:
+        metric_cells.append(Table([[value], [label]], colWidths=[42 * mm]))
+
+    metric_table = Table([metric_cells], colWidths=[43.5 * mm] * 4)
+    metric_table.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, -1), light_blue),
+                ("BOX", (0, 0), (-1, -1), 0.6, line),
+                ("INNERGRID", (0, 0), (-1, -1), 0.3, line),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 2 * mm),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 2 * mm),
+                ("TOPPADDING", (0, 0), (-1, -1), 3 * mm),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 3 * mm),
+            ]
+        )
+    )
+    story.append(metric_table)
+    story.append(Spacer(1, 5 * mm))
+    story.append(
+        Paragraph(
+            f"<b>Zonage PTZ :</b> {_pdf_escape(ptz_text)}",
+            body,
+        )
+    )
+    story.append(Spacer(1, 4 * mm))
+    story.append(Paragraph("Récapitulatif des parcelles", h2))
+
+    summary_data = [
+        [
+            Paragraph("<b>Référence</b>", small),
+            Paragraph("<b>Adresse</b>", small),
+            Paragraph("<b>Surf.</b>", small),
+            Paragraph("<b>Zone PLU</b>", small),
+            Paragraph("<b>PTZ</b>", small),
+            Paragraph("<b>Log.</b>", small),
+        ]
+    ]
+    for _, row in rows.iterrows():
+        summary_data.append(
+            [
+                Paragraph(_pdf_escape(row.get("reference")), small),
+                Paragraph(_pdf_escape(row.get("adresse")), small),
+                Paragraph(_pdf_number(row.get("surface_m2"), 0), small),
+                Paragraph(_pdf_escape(row.get("zone_plu")), small),
+                Paragraph(_pdf_escape(row.get("zone_ptz")), small),
+                Paragraph(_pdf_number(row.get("logements_plu"), 0), small),
+            ]
+        )
+
+    summary_table = Table(
+        summary_data,
+        colWidths=[31 * mm, 64 * mm, 19 * mm, 22 * mm, 14 * mm, 17 * mm],
+        repeatRows=1,
+    )
+    summary_table.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, 0), sagec_blue),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                ("GRID", (0, 0), (-1, -1), 0.35, line),
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F8FAFC")]),
+                ("LEFTPADDING", (0, 0), (-1, -1), 1.5 * mm),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 1.5 * mm),
+                ("TOPPADDING", (0, 0), (-1, -1), 1.6 * mm),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 1.6 * mm),
+            ]
+        )
+    )
+    story.append(summary_table)
+
+    # --------------------------------------------------------------
+    # Fiches par parcelle
+    # --------------------------------------------------------------
+    for _, row in rows.iterrows():
+        story.append(PageBreak())
+
+        ref = str(row.get("reference") or "")
+        address = str(row.get("adresse") or "").strip()
+        if not address:
+            address = (
+                f"Section {row.get('section', '')} n° {row.get('numero', '')} "
+                f"- {commune_name}"
+            )
+
+        story.append(
+            Paragraph(
+                f"Parcelle {_pdf_escape(ref)}",
+                title_style,
+            )
+        )
+        story.append(
+            Paragraph(
+                f"<b>{_pdf_escape(address)}</b><br/>"
+                f"Section {_pdf_escape(row.get('section'))} - "
+                f"N° {_pdf_escape(row.get('numero'))}",
+                subtitle_style,
+            )
+        )
+
+        feature = (feature_map or {}).get(ref)
+
+        key_data = [
+            [
+                Paragraph("Surface terrain", small),
+                Paragraph(f"<b>{_pdf_number(row.get('surface_m2'), 0, ' m²')}</b>", body),
+            ],
+            [
+                Paragraph("Zone PLU", small),
+                Paragraph(f"<b>{_pdf_escape(row.get('zone_plu'))}</b>", body),
+            ],
+            [
+                Paragraph("Zone PTZ", small),
+                Paragraph(f"<b>{_pdf_escape(row.get('zone_ptz'))}</b>", body),
+            ],
+            [
+                Paragraph("Terrain", small),
+                Paragraph(
+                    "<b>Bâti</b>" if bool(row.get("terrain_bati")) else "<b>Nu</b>",
+                    body,
+                ),
+            ],
+            [
+                Paragraph("Score", small),
+                Paragraph(f"<b>{_pdf_number(row.get('score'), 0, ' / 100')}</b>", body),
+            ],
+        ]
+        key_table = Table(key_data, colWidths=[28 * mm, 45 * mm])
+        key_table.setStyle(
+            TableStyle(
+                [
+                    ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#F3F6F8")),
+                    ("GRID", (0, 0), (-1, -1), 0.3, line),
+                    ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 2 * mm),
+                    ("RIGHTPADDING", (0, 0), (-1, -1), 2 * mm),
+                    ("TOPPADDING", (0, 0), (-1, -1), 2.2 * mm),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 2.2 * mm),
+                ]
+            )
+        )
+
+        hero = Table(
+            [[ParcelSketch(feature), key_table]],
+            colWidths=[84 * mm, 78 * mm],
+        )
+        hero.setStyle(
+            TableStyle(
+                [
+                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 0),
+                    ("RIGHTPADDING", (0, 0), (-1, -1), 3 * mm),
+                ]
+            )
+        )
+        story.append(hero)
+        story.append(Spacer(1, 5 * mm))
+
+        story.append(Paragraph("Potentiel urbanistique", h2))
+        urban_data = [
+            [
+                Paragraph("Emprise PLU", small),
+                Paragraph("<b>" + _pdf_number(row.get("emprise_plu_pct"), 1, " %") + "</b>", body),
+                Paragraph("Niveaux PLU", small),
+                Paragraph("<b>" + _pdf_number(row.get("niveaux_plu"), 0) + "</b>", body),
+            ],
+            [
+                Paragraph("Hauteur PLU", small),
+                Paragraph("<b>" + _pdf_number(row.get("hauteur_plu_m"), 1, " m") + "</b>", body),
+                Paragraph("Surface brute", small),
+                Paragraph("<b>" + _pdf_number(row.get("surface_brute_plu_m2"), 0, " m²") + "</b>", body),
+            ],
+            [
+                Paragraph("SDP estimée", small),
+                Paragraph("<b>" + _pdf_number(row.get("sdp_plu_m2"), 0, " m²") + "</b>", body),
+                Paragraph("SHAB estimée", small),
+                Paragraph("<b>" + _pdf_number(row.get("shab_plu_m2"), 0, " m²") + "</b>", body),
+            ],
+            [
+                Paragraph("Logements estimés", small),
+                Paragraph("<b>" + _pdf_number(row.get("logements_plu"), 0) + "</b>", body),
+                Paragraph("Confiance gabarit", small),
+                Paragraph("<b>" + _pdf_number(row.get("gabarit_plu_confiance"), 0, " %") + "</b>", body),
+            ],
+        ]
+        urban_table = Table(
+            urban_data,
+            colWidths=[31 * mm, 48 * mm, 31 * mm, 48 * mm],
+        )
+        urban_table.setStyle(
+            TableStyle(
+                [
+                    ("GRID", (0, 0), (-1, -1), 0.35, line),
+                    ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#F3F6F8")),
+                    ("BACKGROUND", (2, 0), (2, -1), colors.HexColor("#F3F6F8")),
+                    ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 2 * mm),
+                    ("RIGHTPADDING", (0, 0), (-1, -1), 2 * mm),
+                    ("TOPPADDING", (0, 0), (-1, -1), 2 * mm),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 2 * mm),
+                ]
+            )
+        )
+        story.append(urban_table)
+        story.append(Spacer(1, 4 * mm))
+
+        owner = str(row.get("proprietaire_personne_morale") or "").strip()
+        owner_type = str(row.get("proprietaire_type") or "").strip()
+        siren = str(row.get("siren_proprietaire") or "").strip()
+
+        story.append(Paragraph("Informations de prospection", h2))
+        info_rows = [
+            [
+                Paragraph("Propriétaire société / commune", small),
+                Paragraph(
+                    _pdf_escape(owner) if owner else "Non identifié comme personne morale",
+                    body,
+                ),
+            ],
+            [
+                Paragraph("Type propriétaire", small),
+                Paragraph(_pdf_escape(owner_type), body),
+            ],
+            [
+                Paragraph("SIREN", small),
+                Paragraph(_pdf_escape(siren), body),
+            ],
+            [
+                Paragraph("Bâti existant", small),
+                Paragraph(
+                    "Oui" if bool(row.get("terrain_bati")) else "Non",
+                    body,
+                ),
+            ],
+            [
+                Paragraph("Collectif existant", small),
+                Paragraph(
+                    "Oui" if bool(row.get("collectif_existant")) else "Non",
+                    body,
+                ),
+            ],
+        ]
+        info_table = Table(info_rows, colWidths=[52 * mm, 106 * mm])
+        info_table.setStyle(
+            TableStyle(
+                [
+                    ("GRID", (0, 0), (-1, -1), 0.35, line),
+                    ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#F3F6F8")),
+                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 2 * mm),
+                    ("RIGHTPADDING", (0, 0), (-1, -1), 2 * mm),
+                    ("TOPPADDING", (0, 0), (-1, -1), 2 * mm),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 2 * mm),
+                ]
+            )
+        )
+        story.append(info_table)
+        story.append(Spacer(1, 4 * mm))
+
+        prescription_e = str(row.get("prescription_emprise") or "").strip()
+        prescription_h = str(row.get("prescription_hauteur") or "").strip()
+        status = str(row.get("gabarit_plu_statut") or "").strip()
+
+        if prescription_e or prescription_h or status:
+            story.append(Paragraph("Règles et traçabilité", h2))
+            trace_parts = []
+            if status:
+                trace_parts.append(f"<b>Statut :</b> {_pdf_escape(status)}")
+            if prescription_e:
+                trace_parts.append(
+                    f"<b>Emprise :</b> {_pdf_escape(prescription_e)}"
+                )
+            if prescription_h:
+                trace_parts.append(
+                    f"<b>Hauteur :</b> {_pdf_escape(prescription_h)}"
+                )
+            story.append(
+                Paragraph("<br/>".join(trace_parts), small)
+            )
+
+        story.append(Spacer(1, 4 * mm))
+        story.append(
+            Paragraph(
+                "<b>Note :</b> ce dossier constitue une présélection foncière. "
+                "Les capacités indiquées sont à confirmer par une étude réglementaire et architecturale "
+                "complète (retraits, stationnement, OAP, servitudes, risques et autres prescriptions).",
+                small,
+            )
+        )
+
+    doc.build(story, onFirstPage=on_page, onLaterPages=on_page)
+
+    buffer.seek(0)
+    return buffer
+
+
+
+
 # --------------------------
 # Interface
 # --------------------------
-st.title("🏗️ Prospecteur Foncier — V3.7.3 — Mode stable + zonage PTZ")
+st.title("🏗️ Prospecteur Foncier — V3.7.4 — Prospection & dossier PDF")
 st.caption(
-    "Mode stable : cadastre + PLU/PLUi + prescriptions graphiques + propriétaires personnes morales + filtre zonage PTZ."
+    "Cadastre + PLU/PLUi + zonage PTZ + propriétaires personnes morales + lettres SAGEC + dossier PDF de sélection."
 )
 
 st.info(
@@ -2582,7 +3248,6 @@ if results is not None and st.session_state.get("analysis_insee") == insee:
                 "zone_type",
                 "zone_plu",
                 "zone_ptz",
-                "zone_ptz",
                 "habitat_statut",
                 "habitat_preuve",
                 "habitat_confiance",
@@ -2730,7 +3395,50 @@ if results is not None and st.session_state.get("analysis_insee") == insee:
                 )
                 st.rerun()
 
-            st.subheader("4. Courriers de prospection")
+            st.subheader("4. Dossier PDF de la sélection")
+
+            # Toujours reprendre les données les plus récentes (notamment les adresses).
+            latest_pdf = st.session_state["analysis_results"].set_index("reference")
+            pdf_rows = []
+            for _, sel_row in selected.iterrows():
+                ref = sel_row["reference"]
+                if ref in latest_pdf.index:
+                    current = latest_pdf.loc[ref]
+                    if isinstance(current, pd.DataFrame):
+                        current = current.iloc[0]
+                    pdf_rows.append(current.to_dict())
+                else:
+                    pdf_rows.append(sel_row.to_dict())
+
+            pdf_selection_df = pd.DataFrame(pdf_rows)
+
+            try:
+                pdf_buffer = generate_selected_parcels_pdf(
+                    pdf_selection_df,
+                    commune_name=commune_name,
+                    insee=insee,
+                    feature_map=st.session_state.get("feature_map", {}),
+                )
+                st.download_button(
+                    "📄 Télécharger le dossier PDF des parcelles sélectionnées",
+                    data=pdf_buffer.getvalue(),
+                    file_name=(
+                        f"selection_fonciere_{commune_name}_{date.today().isoformat()}.pdf"
+                    ),
+                    mime="application/pdf",
+                )
+                st.caption(
+                    "Le PDF contient une synthèse générale puis une fiche par parcelle "
+                    "avec schéma cadastral, adresse, propriétaire personne morale, zonages "
+                    "et potentiel urbanistique."
+                )
+            except Exception as pdf_exc:
+                st.warning(
+                    "Le dossier PDF n'a pas pu être généré. "
+                    f"Détail : {pdf_exc}"
+                )
+
+            st.subheader("5. Courriers de prospection")
             l1, l2 = st.columns(2)
             with l1:
                 signataire = st.text_input("Signataire", "Nicolas PEDROT")
@@ -2801,7 +3509,8 @@ with st.expander("Ce que la V2 analyse réellement"):
 - **Autres parcelles bâties** : elles restent éligibles, quelle que soit la taille ou l'emprise du bâtiment.
 - **Capacité logements** : SDP = surface brute × ratio SDP ; SHAB = SDP × ratio SHAB ; logements = SHAB ÷ ratio SHAB/logement.
 - **Adresse** : recherchée pour les parcelles sélectionnées via le géocodage inverse de la Géoplateforme.
-- **Courrier** : généré à partir du modèle SAGEC fourni.
+- **Courrier** : généré à partir du nouveau modèle SAGEC amélioré fourni.
+- **Dossier PDF** : synthèse de la sélection + une fiche détaillée par parcelle avec schéma cadastral.
 
 ### Limite actuelle
 Le filtre Habitat exploite désormais les destinations structurées du PLU lorsqu'elles sont disponibles.
